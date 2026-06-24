@@ -5,23 +5,21 @@ A security pipeline framework for LLM-based agents combining **dynamic privilege
 There are 4 main components, **Privilege Control**, **Data Flow Tracking**, **Dynamic Gate Chains**, and **Audit Logging**.
 
 # Current Status
-Implemented: 
+Implemented:
 - Action request model
 - Provenance-aware values
-- Data flow tracking
+- Data flow tracking (Camel-style light provenance tracking)
 - Static policy enforcement
-- LLM policy engine interface
+- LLM policy engine interface with structured XML prompt safeguards
 - Dynamic privilege scoping
 - Escalation workflow
 - Audit logging
 - Unit tests for core functionality
+- Verified live vLLM integration and automated prompt injection resilience tests
 
 Not yet implemented:
 - Full CaMeL provenance propagation
 - End-to-end eval harness
-- vLLM integration tests
-
-All current tests (through pytest) **currently use mocked LLM responses**, am currently adding tests with a live server serving vLLM.
 
 Roadmap: 
 - Data Flow
@@ -31,6 +29,22 @@ Roadmap:
     - Provenance-aware policy rules
     - Full CaMeL-style data flow control
 - Evaluation
-    - Real vLLM integration tests
     - End-to-end eval harness
 
+# Testing
+Codebase supports both isolated unit tests and live infrastructure integration verification.
+
+### Run Core Unit Tests
+To run standard unit tests with mocked LLM responses:
+```bash
+pytest Control-Security-Pipeline/adaptive_policy/tests/ -v
+```
+### Run Live vLLM Tests
+To verify live inference, token parsing, and prompt injection defense layers against your active local model engine:
+
+1. Ensure your vLLM server is running locally (default: `http://localhost:8000` serving `Qwen/Qwen2.5-3B-Instruct`).
+2. Run the integration test suite:
+```bash
+pytest Control-Security-Pipeline/adaptive_policy/tests/test_vllm.py -v -s
+```
+If the test runner detects your server is offline, the live validations will be skipped.
