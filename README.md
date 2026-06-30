@@ -41,10 +41,6 @@ pytest Control-Security-Pipeline/adaptive_policy/tests/ -v
 ```
 ### Run Live vLLM Tests
 To verify live inference, token parsing, and prompt injection defense layers against your active local model engine:
-
-1. Ensure your vLLM server is running locally (default: `http://localhost:8000` serving `Qwen/Qwen2.5-3B-Instruct`).
-2. Run the integration test suite:
 ```bash
 pytest Control-Security-Pipeline/adaptive_policy/tests/test_vllm.py -v -s
 ```
-If the test runner detects your server is offline, the live validations will be skipped.

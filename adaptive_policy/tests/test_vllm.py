@@ -19,9 +19,9 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 '''
 import pytest
-import requests
 import sys
 from pathlib import Path
+from vllm import LLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2])) # quick fix to access adaptive_policy
 
@@ -42,29 +42,21 @@ from adaptive_policy.policy.privilege_control import PrivilegeContext, Privilege
 from adaptive_policy.policy.pipeline import AdaptiveSecurityPipeline
 from adaptive_policy.policy.static_policy import StaticPolicyTable
 
-VLLM_BASE_URL = "http://localhost:8000/v1"
 VLLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 
-def is_vllm_available():
-    try:
-        response = requests.get(f"{VLLM_BASE_URL.replace('/v1', '')}/health", timeout=2)
-        return response.status_code == 200
-    except requests.RequestException:
-        try:
-            response = requests.get(f"{VLLM_BASE_URL}/models", timeout=2)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
-
-pytestmark = pytest.mark.skipif(
-    not is_vllm_available(), 
-    reason=f"vLLM server offline at {VLLM_BASE_URL}"
-)
-
+@pytest.fixture(scope="session")
+def shared_llm():
+    return LLM(
+        model=VLLM_MODEL,
+        dtype="half",
+        gpu_memory_utilization=0.85,
+        tensor_parallel_size=1,
+        enforce_eager=True,
+    )
 
 class TestPrivilegeControlLLM:
-    def test_scope_privileges_live(self):
-        llm = PrivilegeControlLLM(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+    def test_scope_privileges_live(self, shared_llm):
+        llm = PrivilegeControlLLM(llm=shared_llm, model=VLLM_MODEL)
         context = llm.scope_privileges(
             "Send emails to the team and pull up our exchange communication history logs",
             ["send_email", "delete_email", "get_emails"],
@@ -75,18 +67,18 @@ class TestPrivilegeControlLLM:
         assert "get_emails" in context.enabled_actions
         assert context.task == "Send emails to the team and pull up our exchange communication history logs"
 
-    def test_privilege_control_llm_invalid_endpoint_error_handling(self):
-        llm = PrivilegeControlLLM(vllm_base_url="http://localhost:9999/v1", model=VLLM_MODEL)
+    def test_privilege_control_llm_invalid_input_error_handling(self, shared_llm):
+        llm = PrivilegeControlLLM(llm=shared_llm, model=VLLM_MODEL)
         context = llm.scope_privileges(
-            "Send emails",
-            ["send_email", "delete_email"],
+            task=None,
+            available_actions=None,
         )
         assert len(context.enabled_actions) == 0
 
 
 class TestLLMPolicyEngine:
-    def test_evaluate_decision_live(self):
-        engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+    def test_evaluate_decision_live(self, shared_llm):
+        engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
         ar = ActionRequest(
             action_name="delete_email",
             args={"email_id": user_literal("msg_123")},
@@ -100,9 +92,9 @@ class TestLLMPolicyEngine:
 
 
 class TestGateChain:
-    def test_privilege_gate_blocks_disabled_action(self):
+    def test_privilege_gate_blocks_disabled_action(self, shared_llm):
         static_table = StaticPolicyTable(env_type="email")
-        llm_engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+        llm_engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
         gate_chain = GateChain(static_table, llm_engine)
         
         privilege_context = PrivilegeContext(
@@ -119,9 +111,9 @@ class TestGateChain:
         assert decision == FinalDecision.DENIED
         assert "Privilege" in entry.reason or "not enabled" in entry.reason
 
-    def test_static_policy_gate_allows_send_trusted(self):
+    def test_static_policy_gate_allows_send_trusted(self, shared_llm):
         static_table = StaticPolicyTable(env_type="email")
-        llm_engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+        llm_engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
         gate_chain = GateChain(static_table, llm_engine)
         
         privilege_context = PrivilegeContext(
@@ -137,9 +129,9 @@ class TestGateChain:
         decision, entry = gate_chain.process_action(ar, privilege_context)
         assert decision == FinalDecision.ALLOWED
 
-    def test_escalation_workflow_live(self):
+    def test_escalation_workflow_live(self, shared_llm):
         static_table = StaticPolicyTable(env_type="email")
-        llm_engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+        llm_engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
         gate_chain = GateChain(static_table, llm_engine)
         
         privilege_context = PrivilegeContext(
@@ -176,10 +168,10 @@ class TestBenchmarkAdapter:
 
 
 class TestAdaptiveSecurityPipeline:
-    def test_pipeline_initialization_live(self):
+    def test_pipeline_initialization_live(self, shared_llm):
         static_table = StaticPolicyTable(env_type="email")
-        llm_engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
-        priv_llm = PrivilegeControlLLM(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+        llm_engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
+        priv_llm = PrivilegeControlLLM(llm=shared_llm, model=VLLM_MODEL)
         
         pipeline = AdaptiveSecurityPipeline(
             static_table,
@@ -191,10 +183,10 @@ class TestAdaptiveSecurityPipeline:
         context = pipeline.get_privilege_context()
         assert "send_email" in context["enabled_actions"]
 
-    def test_pipeline_process_action_live(self):
+    def test_pipeline_process_action_live(self, shared_llm):
         static_table = StaticPolicyTable(env_type="email")
-        llm_engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
-        priv_llm = PrivilegeControlLLM(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+        llm_engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
+        priv_llm = PrivilegeControlLLM(llm=shared_llm, model=VLLM_MODEL)
         
         pipeline = AdaptiveSecurityPipeline(
             static_table,
@@ -215,12 +207,12 @@ class TestAdaptiveSecurityPipeline:
 
 
 class TestPipelineActiveDefense:
-    def test_pipeline_neutralizes_indirect_prompt_injection(self):
+    def test_pipeline_neutralizes_indirect_prompt_injection(self, shared_llm):
         from adaptive_policy.core.value import tool_result
         
         static_table = StaticPolicyTable(env_type="email")
-        llm_engine = LLMPolicyEngine(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
-        priv_llm = PrivilegeControlLLM(vllm_base_url=VLLM_BASE_URL, model=VLLM_MODEL)
+        llm_engine = LLMPolicyEngine(llm=shared_llm, model=VLLM_MODEL)
+        priv_llm = PrivilegeControlLLM(llm=shared_llm, model=VLLM_MODEL)
         
         pipeline = AdaptiveSecurityPipeline(
             static_table,

@@ -1,11 +1,9 @@
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 from adaptive_policy.logging.audit_log import AuditLog, FinalDecision
 from adaptive_policy.policy.gate_chain import GateChain
-
+from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from vllm import LLM
     from adaptive_policy.core.action_request import ActionRequest
     from adaptive_policy.integrations.benchmark_adapter import AgentDojoToBenchmarkAdapter
     from adaptive_policy.policy.llm_policy_engine import LLMPolicyEngine

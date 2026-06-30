@@ -1,10 +1,9 @@
 from __future__ import annotations
-
 import json
 from dataclasses import dataclass
-
-from openai import OpenAI
-
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from vllm import LLM
 
 @dataclass
 class PrivilegeContext:
@@ -33,11 +32,18 @@ class PrivilegeControlLLM:
 
     def __init__(
         self,
-        vllm_base_url: str = "http://localhost:8000/v1",
+        llm: LLM,   # shared vLLM instance
         model: str = "Qwen/Qwen2.5-3B-Instruct",
     ):
-        self.model = model
-        self._client = OpenAI(base_url=vllm_base_url, api_key="EMPTY")
+        self.model_name = model
+        self.llm = llm
+        self.tokenizer = self.llm.get_tokenizer()
+        
+        from vllm.sampling_params import SamplingParams     # prevents runtime imports if not running this part of the pipeline
+        self.sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=256,
+        )
 
     def scope_privileges(
         self, task: str, available_actions: list[str]
@@ -52,24 +58,28 @@ class PrivilegeControlLLM:
         })
 
         try:
-            resp = self._client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=256,
-                temperature=0.0,
-            )
-            raw = resp.choices[0].message.content.strip()
+            messages = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ]
+            
+            if hasattr(self.tokenizer, "apply_chat_template"):
+                prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                prompt = messages[-1]["content"]
+            
+            outputs = self.llm.generate([prompt], self.sampling_params)
+            raw = outputs[0].outputs[0].text.strip()
             parsed = json.loads(raw)
             enabled = set(parsed.get("enabled_actions", []))
+            
             return PrivilegeContext(
                 enabled_actions=enabled,
                 task=task,
             )
         except Exception as exc:
-            # Fail safe, enables nothing, requires explicit escalation
             print(f"PrivilegeControlLLM error: {exc}")
             return PrivilegeContext(
                 enabled_actions=set(),
