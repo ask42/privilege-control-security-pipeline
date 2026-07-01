@@ -1,7 +1,7 @@
 from __future__ import annotations
 from adaptive_policy.logging.audit_log import AuditLog, FinalDecision
 from adaptive_policy.policy.gate_chain import GateChain
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm import LLM
     from adaptive_policy.core.action_request import ActionRequest
@@ -26,7 +26,7 @@ class AdaptiveSecurityPipeline:
         static_policy_table: StaticPolicyTable,
         llm_policy_engine: LLMPolicyEngine,
         privilege_control_llm: PrivilegeControlLLM,
-        available_actions: list[str],
+        available_actions: list[Any],
     ):
         self.static_policy = static_policy_table
         self.llm_engine = llm_policy_engine
