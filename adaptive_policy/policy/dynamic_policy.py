@@ -1,81 +1,105 @@
 from __future__ import annotations
 
-import sys
 import json
-from pathlib import Path
 from dataclasses import dataclass, field
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
-from enum import Enum
 
 if TYPE_CHECKING:
     from vllm import LLM
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from adaptive_policy.core.action_descriptor import _serialize_action_descriptor
 from adaptive_policy.policy.privilege_control import PrivilegeContext
 
 
-class PolicyDecision(str, Enum):
-    ALLOW = "allow"
-    VERIFY = "verify"
-    DENY = "deny"
-
-
 @dataclass
 class DynamicPolicy:
     """
-    Task-specific policy overlay generated once during task initialization.
+    Task-specific dependency overlay, generated once at task start.
 
-    Only contains modifications relative to the static policy.
+    Does NOT decide allow/verify/deny.
+    Only describes ordering and content constraints for the actions
+    privilege control already enabled.
     """
 
-    overrides: dict[str, PolicyDecision] = field(default_factory=dict)
+    tool_dependencies: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    data_dependencies: dict[str, dict[str, str]] = field(default_factory=dict)
     reasoning: str = ""
 
-    def get(self, action: str) -> PolicyDecision | None:
-        return self.overrides.get(action)
+    def required_actions_for(self, action: str) -> tuple[str, ...]:
+        return self.tool_dependencies.get(action, ())
 
-    def allows(self, action: str) -> bool:
-        return self.overrides.get(action) == PolicyDecision.ALLOW
-
-    def requires_verification(self, action: str) -> bool:
-        return self.overrides.get(action) == PolicyDecision.VERIFY
-
-    def denies(self, action: str) -> bool:
-        return self.overrides.get(action) == PolicyDecision.DENY
+    def required_data_for(self, action: str) -> dict[str, str]:
+        return self.data_dependencies.get(action, {})
 
 
 _SYSTEM_PROMPT = """
-You are a security policy engine. Return ONLY a single JSON object.
+You are a task-specific dependency planner. Return ONLY a single JSON object.
+
+You do NOT decide whether an action is allowed, denied, or requires
+verification - that is static policy's job alone, decided independently of
+this task. Your only job is to describe, for this specific task: (1) which
+already-enabled actions must run before which other already-enabled
+actions, and (2) what concrete argument content an action should contain,
+for actions whose static policy rule flags a content format to check.
 
 Example output:
 {
-  "overrides": {
-      "create_draft": "allow"
+  "tool_dependencies": {
+      "send_email": ["search_contacts"]
   },
-  "reasoning": "Creating a draft is required to fulfill the user request."
+  "data_dependencies": {
+      "send_email": {"to": "alice@company.com"}
+  },
+  "reasoning": "The task asks to email alice@company.com, so send_email's recipient must match that address. The contact must be looked up before emailing."
 }
 
-Rules:
-- Keys in overrides MUST be from the provided 'available_actions'.
-- Values MUST be exactly: "allow", "verify", or "deny".
-- You are provided with a 'static_policy' list of rules, it may not cover all available actions.
-- DO NOT generate an override if the static policy already covers the action with an ALLOW rule, unless the specific task context requires a more restrictive decision (VERIFY or DENY).
-- ALWAYS generate overrides for actions that are:
-    1. Undefined in the static policy.
-    2. Require a higher security level (VERIFY or DENY) than the static policy allows.
-- Use the static policy rules as the baseline safety floor.
+Sections:
+
+1. "tool_dependencies" - for each action in 'available_actions' whose execution
+   only makes sense after some other action(s) in 'available_actions' have
+   already run (e.g. you must look something up before acting on it, or read
+   before writing), list those prerequisite action names. Reason freely from
+   the user task and the available actions - there is no fixed candidate list.
+   Omit actions with no prerequisites.
+
+2. "data_dependencies" - the 'static_policy' entries include a 'data_format'
+   mapping (arg_name -> format, e.g. {"to": "email"}) for some actions. For
+   each such action, if the user task implies a specific, concrete value for
+   that argument (e.g. the task names a specific email address), fill in the
+   exact expected value. Only include an action here if 'static_policy'
+   declared a data_format for it AND the task text pins down a concrete value.
+
+More examples (format only - your output must be a single JSON object like
+the one above, with "tool_dependencies", "data_dependencies", and
+"reasoning" keys):
+
+Task: "Find all emails from alice@company.com and forward them to backup folder"
+  -> tool_dependencies: {"forward_email": ["search_emails"]}, data_dependencies: {}
+  (no specific recipient is named for the forward, so nothing to fill into
+  data_dependencies even though forward_email has a data_format.)
+
+Task: "Reschedule my 2pm meeting and notify attendees"
+  -> tool_dependencies: {"reschedule_event": ["get_calendar_events"], "send_invite": ["get_calendar_events"]}, data_dependencies: {}
+
+Task: "Look up john's contact info and add him to tomorrow's event"
+  -> tool_dependencies: {"add_attendees": ["search_contacts", "get_calendar_events"]}, data_dependencies: {}
+
+Task: "Can you please pay the bill 'bill-december-2023.txt' for me?"
+  -> tool_dependencies: {"send_money": ["read_file"]}, data_dependencies: {}
+  (the bill must be read before paying it - this holds regardless of
+  domain/suite, tool_dependencies is not email-specific.)
+
+Task: "Search my emails for the invoice from Bob, then send him a reply confirming payment"
+  -> tool_dependencies: {"send_email": ["search_emails"]}, data_dependencies: {}
+  (an action with no prerequisites and no task-specific content, like
+  search_emails itself here, is simply omitted from both dicts - don't
+  pad the output with empty/trivial entries.)
 """
 
 
 class DynamicPolicyGenerator:
-    """
-    Generates a task-specific policy overlay once during task initialization.
-
-    The resulting DynamicPolicy is cached and used for the remainder of the task.
-    """
+    """Generates a task-specific dependency overlay once at task start."""
 
     def __init__(
         self,
@@ -90,7 +114,7 @@ class DynamicPolicyGenerator:
 
         self.sampling_params = SamplingParams(
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=4096,
         )
 
     def generate(
@@ -100,11 +124,7 @@ class DynamicPolicyGenerator:
         static_policy: StaticPolicyTable,
         available_actions: Sequence[Any]
     ) -> DynamicPolicy:
-        """
-        Generate a task-specific policy overlay.
-
-        This runs exactly once per task.
-        """
+        """Generate a task-specific dependency overlay. Runs once per task."""
 
         available_action_descriptors = []
 
@@ -113,10 +133,16 @@ class DynamicPolicyGenerator:
             if descriptor["action_name"] in privilege_context.enabled_actions:
                 available_action_descriptors.append(descriptor)
 
+        static_rules = [
+            rule
+            for rule in static_policy.export_rules()
+            if rule["action"] in privilege_context.enabled_actions
+        ]
+
         context = {
             "task": task,
             "available_actions": available_action_descriptors,
-            "static_policy": static_policy.export_rules(),
+            "static_policy": static_rules,
         }
 
         try:
@@ -158,24 +184,43 @@ class DynamicPolicyGenerator:
                 for descriptor in available_action_descriptors
             }
 
-            overrides: dict[str, PolicyDecision] = {}
+            tool_dependencies: dict[str, tuple[str, ...]] = {}
 
-            for action, decision in parsed.get("overrides", {}).items():
-                if action not in valid_actions:
+            for action, prereqs in parsed.get("tool_dependencies", {}).items():
+                if action not in valid_actions or not isinstance(prereqs, Sequence) or isinstance(prereqs, (str, bytes)):
                     continue
 
-                try:
-                    overrides[action] = PolicyDecision(decision)
-                except ValueError:
+                valid_prereqs = tuple(p for p in prereqs if p in valid_actions and p != action)
+                if valid_prereqs:
+                    tool_dependencies[action] = valid_prereqs
+
+            data_format_by_action = {
+                rule["action"]: rule.get("data_format") or {}
+                for rule in context["static_policy"]
+            }
+
+            data_dependencies: dict[str, dict[str, str]] = {}
+
+            for action, args in parsed.get("data_dependencies", {}).items():
+                if action not in valid_actions or not isinstance(args, Mapping):
                     continue
+
+                allowed_args = data_format_by_action.get(action, {})
+                valid_args = {
+                    arg: value
+                    for arg, value in args.items()
+                    if arg in allowed_args
+                }
+                if valid_args:
+                    data_dependencies[action] = valid_args
 
             return DynamicPolicy(
-                overrides=overrides,
+                tool_dependencies=tool_dependencies,
+                data_dependencies=data_dependencies,
                 reasoning=parsed.get("reasoning", ""),
             )
 
         except Exception as exc:
             return DynamicPolicy(
-                overrides={},
                 reasoning=f"Dynamic policy generation failed: {exc}",
             )

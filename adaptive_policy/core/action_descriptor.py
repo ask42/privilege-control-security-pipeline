@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 def _serialize_action_descriptor(action: Any) -> dict[str, Any]:
     """Normalize action inputs into a JSON-safe descriptor for the scoping prompt."""

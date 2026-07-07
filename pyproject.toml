@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-policy"
+version = "0.1.0"
+description = "Security pipeline framework for LLM-based agents combining privilege control, static/dynamic policy gates, and dependency tracking."
+requires-python = ">=3.10"
+dependencies = [
+    "vllm",
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "agentdojo",
+]
+
+[tool.setuptools.packages.find]
+include = ["adaptive_policy*"]

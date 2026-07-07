@@ -1,25 +1,15 @@
 from __future__ import annotations
 
 import pytest
-import sys
-import os
-from pathlib import Path
-from collections.abc import Mapping, Sequence
 from vllm import LLM
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from adaptive_policy.policy.dynamic_policy import DynamicPolicyGenerator, PolicyDecision
+from adaptive_policy.policy.dynamic_policy import DynamicPolicyGenerator
 from adaptive_policy.policy.privilege_control import PrivilegeControlLLM, PrivilegeContext
 from adaptive_policy.policy.static_policy import StaticPolicyTable
 from adaptive_policy.core.action_request import ActionRequest, ActionSource
-from adaptive_policy.core.task_state import TaskExecutionState, build_dependency_rules
-# from adaptive_policy.core.data_flow import DataFlowTracker
 from adaptive_policy.policy.gate_chain import GateChain
 from adaptive_policy.core.value import user_literal
 from adaptive_policy.logging.audit_log import AuditLog, FinalDecision
-from adaptive_policy.core.task_state import TaskExecutionState, build_dependency_rules, ActionDependencyRule
-from adaptive_policy.core.value import Value, Provenance, ProvenanceSource, tool_result
 
 #VLLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 #VLLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
@@ -179,40 +169,18 @@ class TestDynamicPolicyComprehensive:
         
         print(f"\nTask: {task}")
         print(f"Privilege enabled: {len(privilege_context.enabled_actions)}")
-        print(f"Dynamic overrides: {len(dynamic_policy.overrides)}")
-        if dynamic_policy.overrides:
-            print(f"Override decisions: {dynamic_policy.overrides}")
+        print(f"Tool dependencies: {dynamic_policy.tool_dependencies}")
+        print(f"Data dependencies: {dynamic_policy.data_dependencies}")
         print(f"Reasoning: {dynamic_policy.reasoning[:100]}...")
-        
+
         assert dynamic_policy is not None
-        assert isinstance(dynamic_policy.overrides, dict)
+        assert isinstance(dynamic_policy.tool_dependencies, dict)
+        assert isinstance(dynamic_policy.data_dependencies, dict)
         assert dynamic_policy.reasoning
 
-    def test_dynamic_policy_conservative_on_dangerous_actions(self, shared_llm):
-        """Test that dynamic policy doesn't allow dangerous actions."""
-        dynamic_gen = DynamicPolicyGenerator(llm=shared_llm, model=VLLM_MODEL)
-        static_table = StaticPolicyTable(env_type="email")
-        
-        task = "Read emails and calendar"
-        privilege_context = PrivilegeContext(
-            enabled_actions={"get_emails", "search_emails", "get_calendar_events"},
-            task=task,
-        )
-        
-        dynamic_policy = dynamic_gen.generate(
-            task=task,
-            privilege_context=privilege_context,
-            static_policy=static_table,
-            available_actions=LARGE_ACTION_POOL,
-        )
-        
-        print(f"\nTask: {task}")
-        print(f"Dynamic policy allows delete_email: {dynamic_policy.allows('delete_email')}")
-        print(f"Dynamic policy requires verification for delete_email: {dynamic_policy.requires_verification('delete_email')}")
-        
-        # Should not allow dangerous actions
-        assert not dynamic_policy.allows("delete_email")
-        assert not dynamic_policy.allows("export_data")
+    # NOTE: dynamic policy no longer decides allow/verify/deny - only static
+    # policy does (see test_policy_gates.py). So there's no "dynamic policy
+    # conservative on dangerous actions" case to test here anymore.
 
 
 class TestPipelineComprehensive:
@@ -241,7 +209,7 @@ class TestPipelineComprehensive:
         
         print(f"\nTask: {task}")
         print(f"Privileges enabled: {len(context['enabled_actions'])} actions")
-        print(f"Dynamic overrides: {len(dynamic.overrides) if dynamic else 0}")
+        print(f"Tool dependencies: {len(dynamic.tool_dependencies) if dynamic else 0}")
         
         assert context is not None
         assert len(context['enabled_actions']) > 0
@@ -361,100 +329,26 @@ class TestGateChainComprehensive:
         
         assert decision == FinalDecision.DENIED
 
-    '''
-    def test_gate_chain_deny_untrusted_domain(self, shared_llm):
-        """Test gate chain denies send_email to untrusted domain."""
-        gate_chain = GateChain(
-            static_policy_table=StaticPolicyTable(env_type="email"),
-            audit_log=AuditLog(),
-            dynamic_policy=None,
-        )
-        
-        privilege_context = PrivilegeContext(
-            enabled_actions={"send_email"},
-            task="Send email",
-        )
-        
-        ar = ActionRequest(
-            action_name="send_email",
-            args={"to": user_literal("attacker@malicious.com"), "body": user_literal("Hello")},
-            user_request="Send email",
-            source=ActionSource.AGENT,
-        )
-        
-        decision, entry = gate_chain.process_action(ar, privilege_context)
-        print(f"\nAction: send_email (untrusted domain)")
-        print(f"Decision: {decision}")
-        
-        assert decision == FinalDecision.DENIED
-    '''
-
-    def test_dynamic_override_for_undefined_static_action(self, shared_llm):
-        
+    def test_dynamic_policy_generates_reasoning_for_undefined_static_action(self, shared_llm):
+        """create_draft has no static rule. Generation should still run
+        cleanly and produce reasoning instead of erroring out."""
         dynamic_gen = DynamicPolicyGenerator(llm=shared_llm, model=VLLM_MODEL)
         task = "Draft an apology email to the client"
-    
+
         dynamic_policy = dynamic_gen.generate(
             task=task,
             privilege_context=PrivilegeContext(enabled_actions={"create_draft"}, task=task),
             static_policy=StaticPolicyTable(env_type="email"),
             available_actions=LARGE_ACTION_POOL,
         )
-    
-        assert (dynamic_policy.allows("create_draft") or dynamic_policy.requires_verification("create_draft")) is True, "Dynamic policy failed to allow/ask for verification for an undefined action"
-        assert len(dynamic_policy.reasoning) > 0, "Dynamic policy provided no reasoning for the override"
-        print(f"\nOverride Reasoning: {dynamic_policy.reasoning}")
 
-class TestDependencyGates:
-    def test_tool_dependency_gate_failure(self, shared_llm):
-        """Verify GateChain denies action if dependency is missing in TaskState."""
-        gate_chain = GateChain(StaticPolicyTable(env_type="email"))
-        
-        # Action requires 'create_event' first
-        rules = {"send_invite": ActionDependencyRule(required_actions=["create_event"], required_input_args=[])}
-        state = TaskExecutionState(task="test_task") 
-        
-        # 'create_event' not in state.completed_actions
-        ar = ActionRequest(
-            action_name="send_invite", 
-            args={}, 
-            user_request="Send invite", 
-            source=ActionSource.AGENT
-        )
-        priv = PrivilegeContext({"send_invite"}, "Send invite")
-        
-        decision, entry = gate_chain.process_action(ar, priv, task_state=state, dependency_rules=rules)
-        
-        assert decision == FinalDecision.VERIFICATION_REQUIRED
-        assert "Tool Dependency Gate" in entry.reason
-        print(f"\nTool Dependency Gate caught missing prerequisite: {entry.reason}")
+        assert len(dynamic_policy.reasoning) > 0, "Dynamic policy provided no reasoning"
+        print(f"\nReasoning: {dynamic_policy.reasoning}")
 
-    def test_data_dependency_gate_failure(self, shared_llm):
-        """Verify GateChain denies action if data comes from disallowed source."""
-        gate_chain = GateChain(StaticPolicyTable(env_type="email"))
-    
-        # Rule: 'process_data' only accepts data from 'get_emails'
-        rules = {"process_data": ActionDependencyRule(data_sources=["get_emails"])}
-        state = TaskExecutionState(task="email_processing_task")
-        state.mark_completed("get_emails")
-    
-        # This creates a Value object where provenance.tool_name = "search_files"
-        untrusted_value = tool_result("secret_data", tool_name="search_files")
-    
-        ar = ActionRequest(
-            action_name="process_data", 
-            args={"data": untrusted_value}, 
-            user_request="Process", 
-            source=ActionSource.AGENT
-        )
-    
-        priv = PrivilegeContext({"process_data"}, "Process")
-    
-        decision, entry = gate_chain.process_action(ar, priv, state, rules)
-    
-        assert decision == FinalDecision.VERIFICATION_REQUIRED
-        assert "Data Dependency Gate" in entry.reason
-        print(f"\nData Dependency Gate caught invalid source (origin: {untrusted_value.provenance.tool_name}): {entry.reason}")
+
+# NOTE: gate mechanics (dependency block/unblock, static gate rules) are
+# covered deterministically in test_policy_gates.py, which doesn't need
+# shared_llm and avoids an unnecessary GPU boot.
 
 
 if __name__ == "__main__":

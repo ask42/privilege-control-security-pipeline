@@ -1,37 +1,56 @@
 from __future__ import annotations
 
-import sys
 import json
-from pathlib import Path
 from dataclasses import dataclass
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm import LLM
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from adaptive_policy.core.action_descriptor import _serialize_action_descriptor
+
+
 @dataclass
 class PrivilegeContext:
     """Initial privileges granted to the agent for a task."""
     enabled_actions: set[str]
     task: str  # original user task for reference
-    timestamp: float = 0.0
 
 
 _SYSTEM_PROMPT = """
-You are a security privilege controller. 
+You are a security privilege controller. Return ONLY a single JSON object.
+
+You are given the user's task and the full 'available_actions' pool, each with
+a description and parameter schema. This is a least-privilege scoping step,
+not a judgment on whether any individual action is safe, static and dynamic
+policy gates handle that afterward for each action you enable here.
 
 Follow these examples:
 Task: "Delete all draft emails" -> Enabled: ["get_emails", "search_emails", "delete_email"]
-Task: "Look up [name]'s contact info and add them to tomorrow's event" -> Enabled: ["get_calendar_events", "add_attendees", "search_contacts"]
+Task: "Look up john's contact info and add him to tomorrow's event" -> Enabled: ["search_contacts", "get_calendar_events", "add_attendees"]
+Task: "Send a confirmation email to bob@company.com about the meeting tomorrow" -> Enabled: ["send_email", "get_calendar_events"]
+Task: "Reschedule my 2pm meeting and notify attendees" -> Enabled: ["get_calendar_events", "reschedule_event", "send_invite"]
+Task: "Create a new file with project notes and share it with the team" -> Enabled: ["create_file", "share_file"]
+Task: "Generate an export of all my data for backup" -> Enabled: ["export_data", "create_file", "download_file"]
+  (export_data is enabled here even though it sounds sensitive - the task
+  genuinely calls for it. Relevance decides inclusion, not how risky an
+  action sounds; risk is static/dynamic policy's job downstream.)
+Task: "Read my calendar for next week" -> Enabled: ["get_calendar_events"]
+  (read-only task -> read-only action, even if the pool also contains
+  delete_event, change_password, export_data, etc. - none of those are
+  relevant here, so none are enabled.)
 
 INSTRUCTIONS:
-Based on keywords in the user request, identify which actions to enable. Limit to only necessary actions for the task defined.
+- Judge relevance from each action's description and parameters, not just its name.
+- Enable the minimal set of actions necessary to fulfill the task. When unsure
+  whether an action is needed, leave it out - a missing action can be caught
+  and corrected through user verification later; an unnecessarily enabled one
+  cannot.
+- Every entry in "enabled_actions" MUST be an "action_name" from the provided
+  'available_actions'. Never invent an action name.
 
-RESPOND ONLY WITH VALID JSON:
+RESPOND ONLY WITH VALID JSON, matching this exact shape:
 {
   "reasoning": "Step-by-step logic",
   "enabled_actions": ["action_name"]
@@ -57,16 +76,13 @@ class PrivilegeControlLLM:
         from vllm.sampling_params import SamplingParams     # prevents runtime imports if not running this part of the pipeline
         self.sampling_params = SamplingParams(
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=4096,
         )
 
     def scope_privileges(
         self, task: str, available_actions: Sequence[Any] | None
     ) -> PrivilegeContext:
-        """
-        Determine which actions the agent should be allowed to use.
-        Runs once at task start.
-        """
+        """Determine which actions the agent may use. Runs once at task start."""
         available_action_descriptors = [
             _serialize_action_descriptor(action) for action in (available_actions or [])
         ]
@@ -94,9 +110,21 @@ class PrivilegeControlLLM:
             
             outputs = self.llm.generate([prompt], self.sampling_params)
             raw = outputs[0].outputs[0].text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+
             parsed = json.loads(raw)
-            enabled = set(parsed.get("enabled_actions", []))
-            
+
+            valid_actions = {
+                descriptor["action_name"] for descriptor in available_action_descriptors
+            }
+            enabled = {
+                action for action in parsed.get("enabled_actions", [])
+                if action in valid_actions
+            }
+
             return PrivilegeContext(
                 enabled_actions=enabled,
                 task=task,

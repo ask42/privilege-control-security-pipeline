@@ -1,22 +1,15 @@
 import pytest
-from unittest.mock import MagicMock, patch
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2])) # quick fix to access adaptive_policy
 from adaptive_policy import (
     ActionRequest,
     ActionSource,
     AuditEntry,
     AuditLog,
     Allowed,
-    Denied,
     EmailStaticPolicy,
-    PolicyDecision,
-    PolicyModification,
     user_literal,
     tool_result,
 )
+from adaptive_policy.policy.security_policy import VerificationRequired
 from adaptive_policy.policy.static_policy import StaticPolicyTable
 from adaptive_policy.core.data_flow import DataFlowTracker
 
@@ -66,8 +59,8 @@ class TestActionRequest:
 
 
 class TestStaticPolicy:
-    def test_send_email_trusted_domain(self):
-        policy = EmailStaticPolicy(trusted_domains={"company.com"})
+    def test_send_email_allowed_by_declared_rule(self):
+        policy = EmailStaticPolicy()
         ar = ActionRequest(
             action_name="send_email",
             args={"to": user_literal("alice@company.com")},
@@ -77,19 +70,8 @@ class TestStaticPolicy:
         result = policy.evaluate(ar)
         assert isinstance(result, Allowed)
 
-    def test_send_email_untrusted_domain(self):
-        policy = EmailStaticPolicy(trusted_domains={"company.com"})
-        ar = ActionRequest(
-            action_name="send_email",
-            args={"to": user_literal("attacker@evil.com")},
-            user_request="Send",
-            source=ActionSource.AGENT,
-        )
-        result = policy.evaluate(ar)
-        assert isinstance(result, Denied)
-        assert "evil.com" in result.reason
-
-    def test_delete_email_denied(self):
+    def test_delete_email_requires_verification(self):
+        """Deletion asks for verification instead of a hardcoded refusal."""
         policy = EmailStaticPolicy()
         ar = ActionRequest(
             action_name="delete_email",
@@ -98,10 +80,10 @@ class TestStaticPolicy:
             source=ActionSource.AGENT,
         )
         result = policy.evaluate(ar)
-        assert isinstance(result, Denied)
+        assert isinstance(result, VerificationRequired)
 
-    def test_forward_email_trusted_domain(self):
-        policy = EmailStaticPolicy(trusted_domains={"company.com"})
+    def test_forward_email_allowed_by_declared_rule(self):
+        policy = EmailStaticPolicy()
         ar = ActionRequest(
             action_name="forward_email",
             args={"to": user_literal("bob@company.com")},
@@ -168,27 +150,6 @@ class TestDataFlowTracker:
         assert "email_id" in DataFlowTracker.get_untrusted_args(ar)
 
 
-class TestPolicyModification:
-    def test_modification_maintain(self):
-        mod = PolicyModification(
-            decision=PolicyDecision.MAINTAIN,
-            reason="Static policy sufficient",
-        )
-        assert mod.decision == PolicyDecision.MAINTAIN
-        d = mod.to_dict()
-        assert d["decision"] == "maintain"
-
-    def test_modification_escalate(self):
-        mod = PolicyModification(
-            decision=PolicyDecision.ESCALATE,
-            reason="Delete action requires approval",
-            action_to_enable="delete_email",
-        )
-        assert mod.action_to_enable == "delete_email"
-        d = mod.to_dict()
-        assert d["action_to_enable"] == "delete_email"
-
-
 class TestAuditLog:
     def test_audit_entry_creation(self):
         entry = AuditEntry(
@@ -237,22 +198,20 @@ class TestAuditLog:
         assert summary["allowed"] == 1
         assert summary["denied"] == 1
 
-    def test_audit_log_escalation_tracking(self):
+    def test_audit_log_verification_required_tracking(self):
         log = AuditLog()
         log.record(
             AuditEntry(
                 action_request_name="delete_email",
                 user_request="Clean up",
                 static_decision="denied",
-                static_reason="Requires auth",
-                final_decision="escalated",
-                escalation_approved=True,
-                privilege_added={"delete_email"},
+                static_reason="Requires verification",
+                final_decision="verification_required",
             )
         )
         summary = log.summary()
-        assert summary["escalated"] == 1
-        assert summary["escalated_approved"] == 1
+        assert summary["verification_required"] == 1
+        assert summary["verification_rate"] == 1.0
 
 
 if __name__ == "__main__":

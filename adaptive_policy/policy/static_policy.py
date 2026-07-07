@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
 
-from adaptive_policy.policy.security_policy import Allowed, Denied, PolicyResult
+from adaptive_policy.policy.security_policy import Allowed, Denied, PolicyResult, VerificationRequired
 
 if TYPE_CHECKING:
     from adaptive_policy.core.action_request import ActionRequest
@@ -23,6 +24,11 @@ class StaticPolicyRule:
     default_decision: StaticDecision
     description: str
     conditions: tuple[str, ...]
+    data_format: Mapping[str, str] = None  # arg_name -> format hint (e.g. {"to": "email"})
+
+    def __post_init__(self):
+        if self.data_format is None:
+            object.__setattr__(self, "data_format", {})
 
 
 class StaticPolicy(ABC):
@@ -42,6 +48,26 @@ class StaticPolicy(ABC):
         """Machine-readable representation of this policy."""
         raise NotImplementedError
 
+    def default_evaluate(self, action_request: ActionRequest) -> PolicyResult:
+        """Use `_{action_name}_policy` if defined, else the rule's default_decision.
+        No rule at all means VerificationRequired."""
+        method_name = f"_{action_request.action_name}_policy"
+        if hasattr(self, method_name):
+            return getattr(self, method_name)(action_request)
+
+        rule = next(
+            (r for r in self.export_rules() if r.action == action_request.action_name),
+            None,
+        )
+        if rule is None:
+            return VerificationRequired(reason="No static policy rule defined for this action")
+
+        if rule.default_decision == StaticDecision.ALLOW:
+            return Allowed(reason=rule.description)
+        if rule.default_decision == StaticDecision.DENY:
+            return Denied(reason=rule.description)
+        return VerificationRequired(reason=rule.description)
+
 
 class EmailStaticPolicy(StaticPolicy):
     """
@@ -53,10 +79,7 @@ class EmailStaticPolicy(StaticPolicy):
         self.trusted_domains = trusted_domains or {"company.com", "internal.org"}
 
     def evaluate(self, action_request: ActionRequest) -> PolicyResult:
-        method_name = f"_{action_request.action_name}_policy"
-        if hasattr(self, method_name):
-            return getattr(self, method_name)(action_request)
-        return Allowed()
+        return self.default_evaluate(action_request)
 
     def export_rules(self) -> list[StaticPolicyRule]:
         return [
@@ -67,6 +90,7 @@ class EmailStaticPolicy(StaticPolicy):
                 conditions=(
                     "Recipient domain must be trusted.",
                 ),
+                data_format={"to": "email"},
             ),
             StaticPolicyRule(
                 action="delete_email",
@@ -83,6 +107,7 @@ class EmailStaticPolicy(StaticPolicy):
                 conditions=(
                     "Recipient domain must be trusted.",
                 ),
+                data_format={"to": "email"},
             ),
             StaticPolicyRule(
                 action="archive_email",
@@ -136,7 +161,7 @@ class StaticPolicyTable:
         """Evaluate action against the static policy."""
         policy = self.policies.get(action_request.action_name)
         if policy is None:
-            return Allowed()
+            return VerificationRequired(reason="No static policy registered for this action")
         return policy.evaluate(action_request)
 
     def register(self, action_name: str, policy: StaticPolicy) -> None:

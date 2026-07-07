@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from adaptive_policy.logging.audit_log import AuditLog, FinalDecision
 from adaptive_policy.policy.gate_chain import GateChain
-from adaptive_policy.core.task_state import TaskExecutionState, build_dependency_rules
+from adaptive_policy.core.task_state import TaskExecutionState
 from adaptive_policy.policy.dynamic_policy import (
     DynamicPolicy,
     DynamicPolicyGenerator,
@@ -18,20 +16,16 @@ from adaptive_policy.policy.privilege_control import (
 
 if TYPE_CHECKING:
     from adaptive_policy.core.action_request import ActionRequest
-    from adaptive_policy.policy.privilege_control import PrivilegeContext
     from adaptive_policy.policy.static_policy import StaticPolicyTable
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 class AdaptiveSecurityPipeline:
     """
-    Main orchestrator for the adaptive security policy framework.
-    
-    1. Initialize with task + privilege control LLM
-    2. Scope initial privileges
-    3. Generate dynamic policy table
-    3. For each action: run through the gate chain, verify tool and data dependencies
+    Main orchestrator for the security policy framework.
+
+    1. Scope initial privileges
+    2. Generate the dynamic policy
+    3. Run each action through the gate chain
     4. Return results + audit log
     """
 
@@ -47,7 +41,6 @@ class AdaptiveSecurityPipeline:
             raise ValueError("privilege_control_llm is required")
         self.privilege_control_llm = privilege_control_llm
         self.available_actions = available_actions or []
-        self.dependency_rules = build_dependency_rules(self.available_actions)
         self.dynamic_policy_generator = dynamic_policy_generator
         self.dynamic_policy: DynamicPolicy | None = None
         self.audit_log = AuditLog()
@@ -60,9 +53,7 @@ class AdaptiveSecurityPipeline:
         self.task_state = TaskExecutionState(task="")
 
     def initialize_task(self, task_description: str) -> None:
-        """
-        Runs once at task start to scope initial privileges.
-        """
+        """Runs once at task start to scope initial privileges."""
         self.task_state = TaskExecutionState(task=task_description)
         self.privilege_context = self.privilege_control_llm.scope_privileges(
             task_description,
@@ -84,10 +75,9 @@ class AdaptiveSecurityPipeline:
     ) -> tuple[str, dict]:
         """
         Process a single action through the gate chain.
-        
-        Returns: (decision, metadata_dict)
-        - decision: "allowed" | "denied" | "verification_required"
-        - metadata: includes reason, audit entry, modifications
+
+        Returns (decision, metadata). decision is one of
+        "allowed" | "denied" | "verification_required".
         """
         if self.privilege_context is None:
             raise RuntimeError("Must call initialize_task() first")
@@ -96,7 +86,6 @@ class AdaptiveSecurityPipeline:
             action_request,
             self.privilege_context,
             task_state=self.task_state,
-            dependency_rules=self.dependency_rules,
         )
 
         metadata = {
@@ -105,9 +94,15 @@ class AdaptiveSecurityPipeline:
             "reason": audit_entry.reason,
             "audit_entry": audit_entry.to_dict(),
             "dynamic_policy": (
-                self.dynamic_policy.get(action_request.action_name).value
-                if self.dynamic_policy
-                and self.dynamic_policy.get(action_request.action_name) is not None
+                {
+                    "tool_dependencies": list(
+                        self.dynamic_policy.required_actions_for(action_request.action_name)
+                    ),
+                    "data_dependencies": self.dynamic_policy.required_data_for(
+                        action_request.action_name
+                    ),
+                }
+                if self.dynamic_policy is not None
                 else None
             ),
             "privileges_now_enabled": sorted(self.privilege_context.enabled_actions),
