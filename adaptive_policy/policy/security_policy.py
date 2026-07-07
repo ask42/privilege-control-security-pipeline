@@ -2,17 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
-@dataclass(frozen=True)
-class Allowed:
-    """Policy allows the action."""
+@dataclass
+class PolicyResult:
+    """Base class for all policy evaluation results."""
     pass
 
+@dataclass
+class Allowed(PolicyResult):
+    reason: str = "Action allowed"
 
-@dataclass(frozen=True)
-class Denied:
-    """Policy denies the action."""
-    reason: str
+@dataclass
+class Denied(PolicyResult):
+    reason: str = "Action denied"
 
-
-PolicyResult = Allowed | Denied
+@dataclass
+class VerificationRequired(PolicyResult):
+    reason: str = "Action requires user verification"

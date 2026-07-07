@@ -15,6 +15,7 @@ class FinalDecision(str):
     ALLOWED = "allowed"
     DENIED = "denied"
     ESCALATED = "escalated"
+    VERIFICATION_REQUIRED = "verification_required"
 
 
 @dataclass

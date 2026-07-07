@@ -56,4 +56,11 @@ def tool_result(val: Any, tool_name: str, inner_source: str | None = None) -> Va
 
 def transformed(val: Any, from_value: Value) -> Value:
     """Value derived from transformation of another value."""
-    return Value(val, Provenance(ProvenanceSource.TRANSFORM))
+    return Value(
+        val, 
+        Provenance(
+            ProvenanceSource.TRANSFORM, 
+            tool_name=from_value.provenance.tool_name,
+            inner_source=from_value.provenance.inner_source,
+        )
+    )

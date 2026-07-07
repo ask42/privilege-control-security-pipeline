@@ -2,8 +2,6 @@ from adaptive_policy.core.action_request import ActionRequest, ActionSource
 from adaptive_policy.logging.audit_log import AuditEntry, AuditLog
 from adaptive_policy.integrations.benchmark_adapter import AgentDojoToBenchmarkAdapter
 from adaptive_policy.policy.gate_chain import GateChain
-from adaptive_policy.policy.llm_policy_engine import LLMPolicyEngine
-from adaptive_policy.policy.policy_modification import PolicyDecision, PolicyModification
 from adaptive_policy.policy.privilege_control import PrivilegeContext, PrivilegeControlLLM
 from adaptive_policy.policy.security_policy import Allowed, Denied
 from adaptive_policy.policy.static_policy import EmailStaticPolicy, StaticPolicyTable
@@ -21,9 +19,6 @@ __all__ = [
     "Denied",
     "EmailStaticPolicy",
     "GateChain",
-    "LLMPolicyEngine",
-    "PolicyDecision",
-    "PolicyModification",
     "PrivilegeContext",
     "PrivilegeControlLLM",
     "Provenance",

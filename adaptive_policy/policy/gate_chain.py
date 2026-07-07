@@ -1,51 +1,60 @@
 from __future__ import annotations
 
+import sys
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from adaptive_policy.logging.audit_log import AuditEntry, AuditLog, FinalDecision
-from adaptive_policy.policy.policy_modification import PolicyDecision
 from adaptive_policy.policy.security_policy import Allowed, Denied
+from adaptive_policy.core.task_state import ActionDependencyRule, TaskExecutionState
+from adaptive_policy.policy.dynamic_policy import DynamicPolicy, PolicyDecision
+from adaptive_policy.core.data_flow import DataFlowTracker
+from adaptive_policy.policy.security_policy import Allowed, Denied, VerificationRequired
 
 if TYPE_CHECKING:
     from adaptive_policy.core.action_request import ActionRequest
-    from adaptive_policy.policy.llm_policy_engine import LLMPolicyEngine
     from adaptive_policy.policy.privilege_control import PrivilegeContext
     from adaptive_policy.policy.static_policy import StaticPolicyTable
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 class GateChain:
     """
-    Three-stage policy evaluation with escalation workflow, and maintains the audit log / handles human escalation prompts.
+    Five-stage policy evaluation with escalation workflow, and maintains the audit log / handles human escalation prompts.
     
-    Privilege Gate: is action enabled?
-    Static Policy Gate: hardcoded rules in static_policy.py
-    LLM Policy Gate: can escalate/tighten if denied
+    Privilege Gate
+    Static Policy Gate
+    Dynamic Policy Gate
+    Tool Dependency Gate
+    Data Dependency Gate
     """
 
     def __init__(
         self,
         static_policy_table: StaticPolicyTable,
-        llm_policy_engine: LLMPolicyEngine,
         audit_log: AuditLog | None = None,
+        dynamic_policy: DynamicPolicy | None = None,
     ):
         self.static_policy = static_policy_table
-        self.llm_engine = llm_policy_engine
         self.audit_log = audit_log or AuditLog()
+        self.dynamic_policy = dynamic_policy
+
+    def set_dynamic_policy(self, dynamic_policy: DynamicPolicy | None) -> None:
+        self.dynamic_policy = dynamic_policy
 
     def process_action(
         self,
         action_request: ActionRequest,
         privilege_context: PrivilegeContext,
-        escalation_callback: callable | None = None,
+        task_state: TaskExecutionState | None = None,
+        dependency_rules: Mapping[str, ActionDependencyRule] | None = None,
     ) -> tuple[str, AuditEntry]:
         """
         Run action through the three-gate pipeline.
         
-        Returns: (decision: "allowed" | "denied" | "escalated", audit_entry)
-        
-        If escalation_callback is provided and the LLM requests escalation, calls it with the reason. 
-        Callback should only return True (approved) or False (denied).
+        Returns: (decision: "allowed" | "denied" | "verification_required", audit_entry)
         """
 
         entry = AuditEntry(
@@ -60,60 +69,129 @@ class GateChain:
         if action_request.action_name not in privilege_context.enabled_actions:
             entry.static_decision = "denied"
             entry.static_reason = "Action not enabled by privilege control"
-            entry.final_decision = FinalDecision.DENIED
-            entry.reason = "Privilege Gate: action not enabled"
+            entry.final_decision = FinalDecision.DENIED # changed from VERIFICATION_REQUIRED
+            entry.reason = "Privilege Gate: Unauthorized action; request denied"
             self.audit_log.record(entry)
             return FinalDecision.DENIED, entry
 
+        # Tool Dependency Gate
+        if task_state is not None and dependency_rules is not None:
+            dependency_rule = dependency_rules.get(action_request.action_name)
+
+            if dependency_rule is not None:
+
+                missing_completed_actions = [
+                    action
+                    for action in dependency_rule.required_actions
+                    if not task_state.has_completed(action)
+                ]
+
+                if missing_completed_actions:
+                    entry.static_decision = "denied"
+                    entry.static_reason = "Missing prerequisite actions"
+                    entry.final_decision = FinalDecision.VERIFICATION_REQUIRED
+                    entry.reason = (
+                        "Tool Dependency Gate: prerequisite actions have not completed: "
+                        + ", ".join(missing_completed_actions)
+                    )
+                    self.audit_log.record(entry)
+                    return FinalDecision.VERIFICATION_REQUIRED, entry
+
+                missing_input_args = [
+                    arg
+                    for arg in dependency_rule.required_input_args
+                    if arg not in action_request.args
+                ]
+
+                if missing_input_args:
+                    entry.static_decision = "denied"
+                    entry.static_reason = "Missing required input arguments"
+                    entry.final_decision = FinalDecision.VERIFICATION_REQUIRED
+                    entry.reason = (
+                        "Tool Dependency Gate: required inputs missing: "
+                        + ", ".join(missing_input_args)
+                    )
+                    self.audit_log.record(entry)
+                    return FinalDecision.VERIFICATION_REQUIRED, entry
+
+        # Data Dependency Gate
+        if task_state is not None and dependency_rules is not None:
+            dependency_rule = dependency_rules.get(action_request.action_name)
+
+            if dependency_rule is not None:
+
+                tool_sources = DataFlowTracker.tool_sources(action_request)
+
+                disallowed_sources = [
+                    source
+                    for source in tool_sources
+                    if source not in task_state.completed_actions
+                ]
+
+                if disallowed_sources:
+                    entry.static_decision = "denied"
+                    entry.static_reason = "Inputs originate from incomplete tools"
+                    entry.final_decision = FinalDecision.VERIFICATION_REQUIRED
+                    entry.reason = (
+                        "Data Dependency Gate: tool outputs are not yet available: "
+                        + ", ".join(disallowed_sources)
+                    )
+                    self.audit_log.record(entry)
+                    return FinalDecision.VERIFICATION_REQUIRED, entry
+
+                if dependency_rule.data_sources:
+
+                    invalid_sources = [
+                        source
+                        for source in tool_sources
+                        if source not in dependency_rule.data_sources
+                    ]
+
+                    if invalid_sources:
+                        entry.static_decision = "denied"
+                        entry.static_reason = "Unexpected data source"
+                        entry.final_decision = FinalDecision.VERIFICATION_REQUIRED
+                        entry.reason = (
+                            "Data Dependency Gate: inputs came from invalid sources: "
+                            + ", ".join(invalid_sources)
+                        )
+                        self.audit_log.record(entry)
+                        return FinalDecision.VERIFICATION_REQUIRED, entry       
+
         # Static policy gate
         static_result = self.static_policy.evaluate(action_request)
+        if isinstance(static_result, Allowed):
+            decision = PolicyDecision.ALLOW
+        elif isinstance(static_result, VerificationRequired):
+            decision = PolicyDecision.VERIFY
+        else:
+            decision = PolicyDecision.DENY
+            
+        if self.dynamic_policy is not None:
+            decision = self.dynamic_policy.get(action_request.action_name)
+
+        if decision == PolicyDecision.DENY:
+            entry.static_decision = "denied"
+            entry.static_reason = "Denied by task-specific dynamic policy"
+            entry.final_decision = FinalDecision.DENIED
+            entry.reason = "Dynamic Policy Gate: action denied"
+            self.audit_log.record(entry)
+            return FinalDecision.DENIED, entry
+
+        if decision == PolicyDecision.VERIFY:
+            entry.final_decision = FinalDecision.VERIFICATION_REQUIRED
+            entry.reason = "Dynamic Policy Gate: user verification required"
+            self.audit_log.record(entry)
+            return FinalDecision.VERIFICATION_REQUIRED, entry
+            
         if isinstance(static_result, Denied):
             entry.static_decision = "denied"
             entry.static_reason = static_result.reason
+            entry.final_decision = FinalDecision.DENIED
+            entry.reason = f"Static Policy Gate: {static_result.reason}"
 
-            # LLM policy gate (only if denied)
-            llm_mod = self.llm_engine.evaluate(
-                action_request,
-                static_result.reason,
-                self.audit_log,
-            )
-            entry.llm_modification = llm_mod.to_dict()
-
-            # Handle LLM decision
-            if llm_mod.decision == PolicyDecision.TIGHTEN:
-                entry.final_decision = FinalDecision.DENIED
-                entry.reason = f"Static + LLM both deny: {llm_mod.reason}"
-                self.audit_log.record(entry)
-                return FinalDecision.DENIED, entry
-
-            elif llm_mod.decision == PolicyDecision.ESCALATE:
-                if escalation_callback is None:
-                    # No callback: deny by default
-                    entry.final_decision = FinalDecision.DENIED
-                    entry.reason = f"Escalation requested but no handler: {llm_mod.reason}"
-                    self.audit_log.record(entry)
-                    return FinalDecision.DENIED, entry
-
-                # Ask user
-                approved = escalation_callback(llm_mod.reason, llm_mod.action_to_enable)
-                entry.final_decision = FinalDecision.ESCALATED
-                entry.escalation_approved = approved
-
-                if approved and llm_mod.action_to_enable:
-                    entry.privilege_added.add(llm_mod.action_to_enable)
-                    privilege_context.enabled_actions.add(llm_mod.action_to_enable)
-                    entry.reason = f"User approved escalation; enabled {llm_mod.action_to_enable}"
-                else:
-                    entry.reason = f"User denied escalation: {llm_mod.reason}"
-
-                self.audit_log.record(entry)
-                return FinalDecision.ESCALATED, entry
-
-            else:  # Maintain the denial
-                entry.final_decision = FinalDecision.DENIED
-                entry.reason = f"LLM maintains denial: {llm_mod.reason}"
-                self.audit_log.record(entry)
-                return FinalDecision.DENIED, entry
+            self.audit_log.record(entry)
+            return FinalDecision.DENIED, entry
 
         # All gates passed
         entry.static_decision = "allowed"

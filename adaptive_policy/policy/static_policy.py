@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, asdict
+from enum import Enum
 
 from adaptive_policy.policy.security_policy import Allowed, Denied, PolicyResult
 
 if TYPE_CHECKING:
     from adaptive_policy.core.action_request import ActionRequest
+
+
+class StaticDecision(str, Enum):
+    ALLOW = "allow"
+    VERIFY = "verify"
+    DENY = "deny"
+
+
+@dataclass(frozen=True)
+class StaticPolicyRule:
+    action: str
+    default_decision: StaticDecision
+    description: str
+    conditions: tuple[str, ...]
 
 
 class StaticPolicy(ABC):
@@ -19,6 +35,11 @@ class StaticPolicy(ABC):
 
     @abstractmethod
     def evaluate(self, action_request: ActionRequest) -> PolicyResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def export_rules(self) -> list[StaticPolicyRule]:
+        """Machine-readable representation of this policy."""
         raise NotImplementedError
 
 
@@ -37,47 +58,57 @@ class EmailStaticPolicy(StaticPolicy):
             return getattr(self, method_name)(action_request)
         return Allowed()
 
-    def _send_email_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Allow if recipients are in trusted domains."""
-        recipients = action_request.get_arg("to")
-        if recipients:
-            email = recipients.raw
-            if "@" in email:
-                domain = email.split("@")[-1]
-                if domain not in self.trusted_domains:
-                    return Denied(f"Recipient domain {domain} is not in trusted domains")
-        return Allowed()
-
-    def _delete_email_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Deny delete without explicit authorization."""
-        return Denied("Deleting emails requires explicit user authorization")
-
-    def _forward_email_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Allow forwarding to trusted domains; deny otherwise."""
-        to_addr = action_request.get_arg("to")
-        if to_addr:
-            email = to_addr.raw
-            if "@" in email:
-                domain = email.split("@")[-1]
-                if domain not in self.trusted_domains:
-                    return Denied(f"Cannot forward to untrusted domain {domain}")
-        return Allowed()
-
-    def _archive_email_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Allow archiving."""
-        return Allowed()
-
-    def _mark_as_spam_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Allow marking as spam."""
-        return Allowed()
-
-    def _search_emails_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Allow email search."""
-        return Allowed()
-
-    def _get_emails_policy(self, action_request: ActionRequest) -> PolicyResult:
-        """Allow reading emails."""
-        return Allowed()
+    def export_rules(self) -> list[StaticPolicyRule]:
+        return [
+            StaticPolicyRule(
+                action="send_email",
+                default_decision=StaticDecision.ALLOW,
+                description="Send email",
+                conditions=(
+                    "Recipient domain must be trusted.",
+                ),
+            ),
+            StaticPolicyRule(
+                action="delete_email",
+                default_decision=StaticDecision.VERIFY,
+                description="Delete email",
+                conditions=(
+                    "Requires explicit user authorization.",
+                ),
+            ),
+            StaticPolicyRule(
+                action="forward_email",
+                default_decision=StaticDecision.ALLOW,
+                description="Forward email",
+                conditions=(
+                    "Recipient domain must be trusted.",
+                ),
+            ),
+            StaticPolicyRule(
+                action="archive_email",
+                default_decision=StaticDecision.ALLOW,
+                description="Archive email",
+                conditions=(),
+            ),
+            StaticPolicyRule(
+                action="mark_as_spam",
+                default_decision=StaticDecision.ALLOW,
+                description="Mark email as spam",
+                conditions=(),
+            ),
+            StaticPolicyRule(
+                action="search_emails",
+                default_decision=StaticDecision.ALLOW,
+                description="Search emails",
+                conditions=(),
+            ),
+            StaticPolicyRule(
+                action="get_emails",
+                default_decision=StaticDecision.ALLOW,
+                description="Read emails",
+                conditions=(),
+            ),
+        ]
 
 
 class StaticPolicyTable:
@@ -111,3 +142,22 @@ class StaticPolicyTable:
     def register(self, action_name: str, policy: StaticPolicy) -> None:
         """Register a custom policy for an action."""
         self.policies[action_name] = policy
+
+    def export_rules(self) -> list[dict[str, Any]]:
+        rules = []
+
+        seen = set()
+
+        for policy in self.policies.values():
+            if id(policy) in seen:
+                continue
+            seen.add(id(policy))
+
+            for rule in policy.export_rules():
+                rule_dict = asdict(rule)
+                rule_dict["default_decision"] = rule.default_decision.value
+                rules.append(rule_dict)
+
+        return rules    
+
+

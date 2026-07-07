@@ -42,3 +42,11 @@ class DataFlowTracker:
             k: v.provenance.source.value
             for k, v in action_request.args.items()
         }
+
+    @staticmethod
+    def tool_sources(action_request):
+        return {
+            arg.provenance.tool_name
+            for arg in action_request.args.values()
+            if arg.is_tool_sourced()
+        }
