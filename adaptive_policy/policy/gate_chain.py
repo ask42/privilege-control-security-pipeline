@@ -7,6 +7,7 @@ from adaptive_policy.logging.audit_log import AuditEntry, AuditLog, FinalDecisio
 from adaptive_policy.core.task_state import TaskExecutionState
 from adaptive_policy.policy.dynamic_policy import DynamicPolicy
 from adaptive_policy.policy.security_policy import Allowed, Denied, VerificationRequired
+from adaptive_policy.policy.static_policy import _resolve_arg_value, _values_match
 
 if TYPE_CHECKING:
     from adaptive_policy.core.action_request import ActionRequest
@@ -107,11 +108,14 @@ class GateChain:
         if self.dynamic_policy is not None:
             required_data = self.dynamic_policy.required_data_for(action_request.action_name)
 
+            # Same alias-aware lookup the Static Policy Gate's format check
+            # uses (e.g. "to" resolves to a real "recipients" arg), so a
+            # canonical data_format key matches regardless of what the
+            # actual tool schema calls the field.
             mismatched_args = [
                 arg
                 for arg, expected_value in required_data.items()
-                if action_request.get_arg(arg) is None
-                or action_request.get_arg(arg).raw != expected_value
+                if not _values_match(_resolve_arg_value(action_request, arg), expected_value)
             ]
 
             if mismatched_args:

@@ -16,6 +16,7 @@ class PrivilegeContext:
     """Initial privileges granted to the agent for a task."""
     enabled_actions: set[str]
     task: str  # original user task for reference
+    reasoning: str = ""  # LLM's stated reasoning for this scoping decision
 
 
 _SYSTEM_PROMPT = """
@@ -128,10 +129,12 @@ class PrivilegeControlLLM:
             return PrivilegeContext(
                 enabled_actions=enabled,
                 task=task,
+                reasoning=parsed.get("reasoning", ""),
             )
         except Exception as exc:
             print(f"PrivilegeControlLLM error: {exc}")
             return PrivilegeContext(
                 enabled_actions=set(),
                 task=task,
+                reasoning=f"Privilege scoping failed: {exc}",
             )

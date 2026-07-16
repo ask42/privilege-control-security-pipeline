@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from vllm import LLM
 
 from agentdojo.functions_runtime import FunctionCall
 from adaptive_policy.core.action_request import ActionRequest, ActionSource
@@ -15,9 +14,7 @@ from adaptive_policy.policy.dynamic_policy import DynamicPolicy, DynamicPolicyGe
 from adaptive_policy.policy.pipeline import AdaptiveSecurityPipeline
 from adaptive_policy.policy.privilege_control import PrivilegeControlLLM
 from adaptive_policy.policy.static_policy import StaticPolicyTable
-
-VLLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
-
+from adaptive_policy.tests.conftest import VLLM_MODEL
 
 @dataclass(frozen=True)
 class AgentDojoCase:
@@ -58,18 +55,6 @@ def _priv_llm_for(enabled_actions: list[str]) -> PrivilegeControlLLM:
         "reasoning": "stubbed for dependency-gate test",
     })
     return PrivilegeControlLLM(llm=_StaticLLM(stub_response), model=VLLM_MODEL)
-
-
-@pytest.fixture(scope="session")
-def shared_llm():
-    return LLM(
-        model=VLLM_MODEL,
-        dtype="half",
-        max_model_len=32768,
-        gpu_memory_utilization=0.85,
-        tensor_parallel_size=1,
-        enforce_eager=True,
-    )
 
 
 def load_agentdojo_action_descriptors(suite_name: str) -> list[dict[str, object]]:

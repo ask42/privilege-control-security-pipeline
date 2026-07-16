@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 from adaptive_policy.core.action_descriptor import _serialize_action_descriptor
 from adaptive_policy.policy.privilege_control import PrivilegeContext
+from adaptive_policy.policy.static_policy import _matches_data_format
 
 
 @dataclass
@@ -23,13 +24,13 @@ class DynamicPolicy:
     """
 
     tool_dependencies: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    data_dependencies: dict[str, dict[str, str]] = field(default_factory=dict)
+    data_dependencies: dict[str, dict[str, Any]] = field(default_factory=dict)
     reasoning: str = ""
 
     def required_actions_for(self, action: str) -> tuple[str, ...]:
         return self.tool_dependencies.get(action, ())
 
-    def required_data_for(self, action: str) -> dict[str, str]:
+    def required_data_for(self, action: str) -> dict[str, Any]:
         return self.data_dependencies.get(action, {})
 
 
@@ -46,12 +47,12 @@ for actions whose static policy rule flags a content format to check.
 Example output:
 {
   "tool_dependencies": {
-      "send_email": ["search_contacts"]
+      "send_email": ["search_contacts_by_name"]
   },
   "data_dependencies": {
-      "send_email": {"to": "alice@company.com"}
+      "send_email": {"recipients": ["alice@company.com"]}
   },
-  "reasoning": "The task asks to email alice@company.com, so send_email's recipient must match that address. The contact must be looked up before emailing."
+  "reasoning": "The task asks to email alice@company.com, so send_email's recipients must match that address. The contact must be looked up before emailing."
 }
 
 Sections:
@@ -63,21 +64,22 @@ Sections:
    the user task and the available actions - there is no fixed candidate list.
    Omit actions with no prerequisites.
 
-2. "data_dependencies" - the 'static_policy' entries include a 'data_format'
-   mapping (arg_name -> format, e.g. {"to": "email"}) for some actions. For
-   each such action, if the user task implies a specific, concrete value for
-   that argument (e.g. the task names a specific email address), fill in the
-   exact expected value. Only include an action here if 'static_policy'
-   declared a data_format for it AND the task text pins down a concrete value.
+2. "data_dependencies" - some entries in 'available_actions' carry a nested
+   'static_policy' object with a 'data_format' mapping (arg_name -> format,
+   e.g. {"recipients": "email"}). For each such action, if the user task implies a
+   specific, concrete value for that argument (e.g. the task names a
+   specific email address), fill in the exact expected value. Only include
+   an action here if its 'static_policy.data_format' declared that arg AND
+   the task text pins down a concrete value.
 
 More examples (format only - your output must be a single JSON object like
 the one above, with "tool_dependencies", "data_dependencies", and
 "reasoning" keys):
 
-Task: "Find all emails from alice@company.com and forward them to backup folder"
-  -> tool_dependencies: {"forward_email": ["search_emails"]}, data_dependencies: {}
-  (no specific recipient is named for the forward, so nothing to fill into
-  data_dependencies even though forward_email has a data_format.)
+Task: "Search my emails for messages from newsletter@company.com and delete them"
+  -> tool_dependencies: {"delete_email": ["search_emails"]}, data_dependencies: {}
+  (delete_email always requires verification regardless of content, and no
+  destination address is involved in a delete, so data_dependencies stays empty.)
 
 Task: "Reschedule my 2pm meeting and notify attendees"
   -> tool_dependencies: {"reschedule_event": ["get_calendar_events"], "send_invite": ["get_calendar_events"]}, data_dependencies: {}
@@ -96,6 +98,34 @@ Task: "Search my emails for the invoice from Bob, then send him a reply confirmi
   search_emails itself here, is simply omitted from both dicts - don't
   pad the output with empty/trivial entries.)
 """
+
+
+def _build_enabled_action_contexts(
+    available_actions: Sequence[Any],
+    enabled_actions: set[str],
+    static_policy: StaticPolicyTable,
+) -> list[dict[str, Any]]:
+    """
+    One entry per privilege-enabled action, each carrying its own tool
+    descriptor plus its static policy rule nested under "static_policy"
+    (None if the action has no declared rule). Merging these up front means
+    the LLM reads one self-contained object per action.
+    """
+    rules_by_action = {
+        rule["action"]: {k: v for k, v in rule.items() if k != "action"}
+        for rule in static_policy.export_rules()
+    }
+
+    action_contexts = []
+    for action in available_actions:
+        descriptor = _serialize_action_descriptor(action)
+        action_name = descriptor["action_name"]
+        if action_name not in enabled_actions:
+            continue
+        descriptor["static_policy"] = rules_by_action.get(action_name)
+        action_contexts.append(descriptor)
+
+    return action_contexts
 
 
 class DynamicPolicyGenerator:
@@ -126,23 +156,13 @@ class DynamicPolicyGenerator:
     ) -> DynamicPolicy:
         """Generate a task-specific dependency overlay. Runs once per task."""
 
-        available_action_descriptors = []
-
-        for action in available_actions:
-            descriptor = _serialize_action_descriptor(action)
-            if descriptor["action_name"] in privilege_context.enabled_actions:
-                available_action_descriptors.append(descriptor)
-
-        static_rules = [
-            rule
-            for rule in static_policy.export_rules()
-            if rule["action"] in privilege_context.enabled_actions
-        ]
+        action_contexts = _build_enabled_action_contexts(
+            available_actions, privilege_context.enabled_actions, static_policy
+        )
 
         context = {
             "task": task,
-            "available_actions": available_action_descriptors,
-            "static_policy": static_rules,
+            "available_actions": action_contexts,
         }
 
         try:
@@ -181,7 +201,7 @@ class DynamicPolicyGenerator:
 
             valid_actions = {
                 descriptor["action_name"]
-                for descriptor in available_action_descriptors
+                for descriptor in action_contexts
             }
 
             tool_dependencies: dict[str, tuple[str, ...]] = {}
@@ -195,21 +215,22 @@ class DynamicPolicyGenerator:
                     tool_dependencies[action] = valid_prereqs
 
             data_format_by_action = {
-                rule["action"]: rule.get("data_format") or {}
-                for rule in context["static_policy"]
+                descriptor["action_name"]: (descriptor["static_policy"] or {}).get("data_format") or {}
+                for descriptor in action_contexts
             }
 
-            data_dependencies: dict[str, dict[str, str]] = {}
+            data_dependencies: dict[str, dict[str, Any]] = {}
 
             for action, args in parsed.get("data_dependencies", {}).items():
                 if action not in valid_actions or not isinstance(args, Mapping):
                     continue
 
                 allowed_args = data_format_by_action.get(action, {})
+                # Drop args not declared in data_format (unknown constraint) and declared args whose own value fails the format check
                 valid_args = {
                     arg: value
                     for arg, value in args.items()
-                    if arg in allowed_args
+                    if arg in allowed_args and _matches_data_format(value, allowed_args[arg])
                 }
                 if valid_args:
                     data_dependencies[action] = valid_args

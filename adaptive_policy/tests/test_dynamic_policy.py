@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from vllm import LLM
 
 from adaptive_policy.policy.dynamic_policy import DynamicPolicyGenerator
 from adaptive_policy.policy.privilege_control import PrivilegeControlLLM, PrivilegeContext
@@ -10,10 +9,7 @@ from adaptive_policy.core.action_request import ActionRequest, ActionSource
 from adaptive_policy.policy.gate_chain import GateChain
 from adaptive_policy.core.value import user_literal
 from adaptive_policy.logging.audit_log import AuditLog, FinalDecision
-
-#VLLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"
-#VLLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
-VLLM_MODEL = "Qwen/Qwen3-8B"
+from adaptive_policy.tests.conftest import VLLM_MODEL
 
 LARGE_ACTION_POOL = [
     # Email actions
@@ -79,20 +75,6 @@ TASK_SCENARIOS = [
     ("Delete all draft emails",
      ["get_emails", "delete_email", "search_emails"]),
 ]
-
-@pytest.fixture(scope="session")
-def shared_llm():
-    return LLM(
-        model=VLLM_MODEL,
-        dtype="half",
-        max_model_len=32768,
-        gpu_memory_utilization=0.85,
-        tensor_parallel_size=1,
-        block_size=16,
-        enforce_eager=True,
-        enable_chunked_prefill=False,
-    )
-
 
 class TestPrivilegeControlComprehensive:
     """Comprehensive tests for privilege control LLM scoping."""
@@ -171,17 +153,12 @@ class TestDynamicPolicyComprehensive:
         print(f"Privilege enabled: {len(privilege_context.enabled_actions)}")
         print(f"Tool dependencies: {dynamic_policy.tool_dependencies}")
         print(f"Data dependencies: {dynamic_policy.data_dependencies}")
-        print(f"Reasoning: {dynamic_policy.reasoning[:100]}...")
+        print(f"Reasoning: {dynamic_policy.reasoning}") # removed 100 char limit for debugging
 
         assert dynamic_policy is not None
         assert isinstance(dynamic_policy.tool_dependencies, dict)
         assert isinstance(dynamic_policy.data_dependencies, dict)
         assert dynamic_policy.reasoning
-
-    # NOTE: dynamic policy no longer decides allow/verify/deny - only static
-    # policy does (see test_policy_gates.py). So there's no "dynamic policy
-    # conservative on dangerous actions" case to test here anymore.
-
 
 class TestPipelineComprehensive:
     """Comprehensive tests for full pipeline workflow."""
@@ -344,12 +321,6 @@ class TestGateChainComprehensive:
 
         assert len(dynamic_policy.reasoning) > 0, "Dynamic policy provided no reasoning"
         print(f"\nReasoning: {dynamic_policy.reasoning}")
-
-
-# NOTE: gate mechanics (dependency block/unblock, static gate rules) are
-# covered deterministically in test_policy_gates.py, which doesn't need
-# shared_llm and avoids an unnecessary GPU boot.
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

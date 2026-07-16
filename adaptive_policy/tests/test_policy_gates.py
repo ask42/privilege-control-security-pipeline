@@ -61,6 +61,26 @@ class TestStaticPolicyGate:
         decision, _ = gc.process_action(ar, priv)
         assert decision == FinalDecision.ALLOWED
 
+    def test_send_email_allowed_when_optional_cc_bcc_omitted(self):
+        """cc/bcc are optional args on the real send_email schema; omitting
+        them must not fail the format check (regression: absent args used
+        to be treated as an invalid value instead of 'nothing to check')."""
+        table = StaticPolicyTable(env_type="email")
+        gc = GateChain(table)
+        ar = _action("send_email", {"recipients": "alice@company.com", "body": "hi"})
+        priv = PrivilegeContext({"send_email"}, "task")
+        decision, _ = gc.process_action(ar, priv)
+        assert decision == FinalDecision.ALLOWED
+
+    def test_send_email_blocked_when_cc_has_invalid_format(self):
+        table = StaticPolicyTable(env_type="email")
+        gc = GateChain(table)
+        ar = _action("send_email", {"recipients": "alice@company.com", "cc": "not-an-email", "body": "hi"})
+        priv = PrivilegeContext({"send_email"}, "task")
+        decision, entry = gc.process_action(ar, priv)
+        assert decision == FinalDecision.VERIFICATION_REQUIRED
+        assert "cc" in entry.reason
+
     def test_delete_email_requires_verification_by_declared_rule(self):
         """Regression test: evaluate() used to always return Allowed()
         regardless of the declared rule. Proves the VERIFY rule is enforced."""
@@ -84,7 +104,7 @@ class TestStaticPolicyGate:
         It must not change a static decision either way."""
         table = StaticPolicyTable(env_type="email")
 
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"send_email": ("get_emails",)}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"send_email": ("search_emails",)}))
         ar = _action("send_email", {"to": "alice@company.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         # No task_state, so the tool dependency gate can't block. Static ALLOW decides.
@@ -102,7 +122,7 @@ class TestStaticPolicyGate:
 
     def test_undefined_static_action_stays_verify_regardless_of_dynamic_policy(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"create_draft": ("get_emails",)}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"create_draft": ("search_emails",)}))
         ar = _action("create_draft")
         priv = PrivilegeContext({"create_draft"}, "task")
         decision, _ = gc.process_action(ar, priv)
@@ -112,21 +132,21 @@ class TestStaticPolicyGate:
 class TestToolDependencyGate:
     def test_blocks_when_prerequisite_incomplete(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"forward_email": ("search_emails",)}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"send_email": ("search_emails",)}))
         state = TaskExecutionState(task="t")
-        ar = _action("forward_email", {"to": "alice@company.com"})
-        priv = PrivilegeContext({"forward_email"}, "task")
+        ar = _action("send_email", {"to": "alice@company.com"})
+        priv = PrivilegeContext({"send_email"}, "task")
         decision, entry = gc.process_action(ar, priv, task_state=state)
         assert decision == FinalDecision.VERIFICATION_REQUIRED
         assert "Tool Dependency Gate" in entry.reason
 
     def test_allows_once_prerequisite_completed(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"forward_email": ("search_emails",)}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"send_email": ("search_emails",)}))
         state = TaskExecutionState(task="t")
         state.mark_completed("search_emails")
-        ar = _action("forward_email", {"to": "alice@company.com"})
-        priv = PrivilegeContext({"forward_email"}, "task")
+        ar = _action("send_email", {"to": "alice@company.com"})
+        priv = PrivilegeContext({"send_email"}, "task")
         decision, _ = gc.process_action(ar, priv, task_state=state)
         assert decision == FinalDecision.ALLOWED
 
@@ -134,9 +154,9 @@ class TestToolDependencyGate:
         """No TaskExecutionState means nothing to check completion against,
         so the gate must not block or crash."""
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"forward_email": ("search_emails",)}))
-        ar = _action("forward_email", {"to": "alice@company.com"})
-        priv = PrivilegeContext({"forward_email"}, "task")
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"send_email": ("search_emails",)}))
+        ar = _action("send_email", {"to": "alice@company.com"})
+        priv = PrivilegeContext({"send_email"}, "task")
         decision, _ = gc.process_action(ar, priv)
         assert decision == FinalDecision.ALLOWED
 
@@ -144,8 +164,8 @@ class TestToolDependencyGate:
 class TestDataDependencyGate:
     def test_blocks_on_content_mismatch(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"to": "alice@company.com"}}))
-        ar = _action("send_email", {"to": "mallory@attacker.com", "body": "hi"})
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"recipients": "alice@company.com"}}))
+        ar = _action("send_email", {"recipients": "mallory@attacker.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, entry = gc.process_action(ar, priv)
         assert decision == FinalDecision.VERIFICATION_REQUIRED
@@ -153,8 +173,8 @@ class TestDataDependencyGate:
 
     def test_allows_on_content_match(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"to": "alice@company.com"}}))
-        ar = _action("send_email", {"to": "alice@company.com", "body": "hi"})
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"recipients": "alice@company.com"}}))
+        ar = _action("send_email", {"recipients": "alice@company.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, _ = gc.process_action(ar, priv)
         assert decision == FinalDecision.ALLOWED
@@ -163,11 +183,45 @@ class TestDataDependencyGate:
         """Dynamic policy expects a 'subject' value not present in the request."""
         table = StaticPolicyTable(env_type="email")
         gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"subject": "Re: invoice"}}))
-        ar = _action("send_email", {"to": "alice@company.com", "body": "hi"})
+        ar = _action("send_email", {"recipients": "alice@company.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, entry = gc.process_action(ar, priv)
         assert decision == FinalDecision.VERIFICATION_REQUIRED
         assert "Data Dependency Gate" in entry.reason
+
+    def test_resolves_alias_between_dependency_key_and_real_arg_name(self):
+        """data_dependencies is keyed by the canonical name ('recipients'),
+        but the real action request may use an alias ('to', as hand-written
+        fixtures do) - the gate must resolve through the same alias table
+        the Static Policy Gate's format check uses."""
+        table = StaticPolicyTable(env_type="email")
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"recipients": "alice@company.com"}}))
+        ar = _action("send_email", {"to": "alice@company.com", "body": "hi"})
+        priv = PrivilegeContext({"send_email"}, "task")
+        decision, _ = gc.process_action(ar, priv)
+        assert decision == FinalDecision.ALLOWED
+
+    def test_list_valued_arg_uses_strict_order_independent_set_equality(self):
+        """recipients is a list on the real schema. Same members in a
+        different order must still match; an extra/different member must
+        still be flagged, not silently allowed."""
+        table = StaticPolicyTable(env_type="email")
+        gc = GateChain(
+            table,
+            dynamic_policy=DynamicPolicy(
+                data_dependencies={"send_email": {"recipients": ["alice@company.com", "bob@company.com"]}}
+            ),
+        )
+        priv = PrivilegeContext({"send_email"}, "task")
+
+        same_set_different_order = _action("send_email", {"recipients": ["bob@company.com", "alice@company.com"], "body": "hi"})
+        decision, _ = gc.process_action(same_set_different_order, priv)
+        assert decision == FinalDecision.ALLOWED
+
+        extra_recipient = _action("send_email", {"recipients": ["alice@company.com", "bob@company.com", "mallory@attacker.com"], "body": "hi"})
+        decision2, entry2 = gc.process_action(extra_recipient, priv)
+        assert decision2 == FinalDecision.VERIFICATION_REQUIRED
+        assert "Data Dependency Gate" in entry2.reason
 
 
 class TestDynamicPolicyGeneratorParsing:
@@ -195,7 +249,7 @@ class TestDynamicPolicyGeneratorParsing:
     def test_filters_data_dependency_args_not_declared_in_data_format(self):
         response = json.dumps({
             "tool_dependencies": {},
-            "data_dependencies": {"send_email": {"to": "alice@company.com", "body": "malicious injected text"}},
+            "data_dependencies": {"send_email": {"recipients": "alice@company.com", "body": "malicious injected text"}},
             "reasoning": "test",
         })
         gen = self._generator(response)
@@ -205,8 +259,8 @@ class TestDynamicPolicyGeneratorParsing:
             task="task", privilege_context=priv, static_policy=table,
             available_actions=["send_email"],
         )
-        # send_email's static rule only declares data_format for "to", not "body".
-        assert policy.data_dependencies["send_email"] == {"to": "alice@company.com"}
+        # send_email's static rule declares data_format for recipients/cc/bcc, not body.
+        assert policy.data_dependencies["send_email"] == {"recipients": "alice@company.com"}
 
     def test_prompt_context_excludes_static_rules_for_non_enabled_actions(self):
         """delete_email is registered but not enabled for this task, so its
@@ -228,17 +282,17 @@ class TestDynamicPolicyGeneratorParsing:
 
     def test_strips_markdown_fences_before_parsing(self):
         response = "```json\n" + json.dumps({
-            "tool_dependencies": {"send_email": ["get_emails"]},
+            "tool_dependencies": {"send_email": ["search_emails"]},
             "reasoning": "fenced",
         }) + "\n```"
         gen = self._generator(response)
         table = StaticPolicyTable(env_type="email")
-        priv = PrivilegeContext({"send_email", "get_emails"}, "task")
+        priv = PrivilegeContext({"send_email", "search_emails"}, "task")
         policy = gen.generate(
             task="task", privilege_context=priv, static_policy=table,
-            available_actions=["send_email", "get_emails"],
+            available_actions=["send_email", "search_emails"],
         )
-        assert policy.tool_dependencies.get("send_email") == ("get_emails",)
+        assert policy.tool_dependencies.get("send_email") == ("search_emails",)
         assert policy.reasoning == "fenced"
 
     def test_malformed_json_fails_closed_with_empty_policy(self):
@@ -261,7 +315,7 @@ class TestPrivilegeControlParsing:
         }) + "\n```"
         llm = PrivilegeControlLLM(llm=_StaticLLM(response), model="stub")
         ctx = llm.scope_privileges("send an email", [
-            {"action_name": "send_email"}, {"action_name": "get_emails"},
+            {"action_name": "send_email"}, {"action_name": "search_emails"},
         ])
         assert ctx.enabled_actions == {"send_email"}
 
@@ -272,11 +326,11 @@ class TestPrivilegeControlParsing:
 
 
 _GENERIC_PRIVILEGE_SCENARIOS = [
-    ("Send an email to Alice and then archive the sent copy.", ["send_email", "archive_email"]),
-    ("Read the inbox and then search old email threads.", ["get_emails", "search_emails"]),
-    ("Delete the spam message after confirming it is spam.", ["mark_as_spam", "delete_email"]),
-    ("Forward the message to Bob after checking the sender.", ["forward_email", "get_emails"]),
-    ("Please show me my unread emails.", ["get_emails"]),
+    ("Send an email to Alice and then check my sent folder.", ["send_email", "get_sent_emails"]),
+    ("Read the inbox and then search old email threads.", ["get_received_emails", "search_emails"]),
+    ("Delete the spam message after confirming it is spam.", ["search_emails", "delete_email"]),
+    ("Look up Bob's email address, then message him.", ["search_contacts_by_name", "send_email"]),
+    ("Please show me my unread emails.", ["get_unread_emails"]),
 ]
 
 
@@ -289,8 +343,9 @@ class TestPrivilegeControlScoping:
     def test_scope_privileges_threads_stubbed_response(self, task, expected_actions):
         action_pool = [
             {"action_name": name} for name in
-            ["send_email", "archive_email", "get_emails", "search_emails",
-             "delete_email", "mark_as_spam", "forward_email"]
+            ["send_email", "delete_email", "get_unread_emails", "get_sent_emails",
+             "get_received_emails", "get_draft_emails", "search_emails",
+             "search_contacts_by_name", "search_contacts_by_email"]
         ]
         llm = PrivilegeControlLLM(
             llm=_StaticLLM(json.dumps({"enabled_actions": expected_actions, "reasoning": "stub"})),
@@ -329,7 +384,7 @@ class TestFullPipelineDependencySequencing:
     def test_enforces_sequence_and_unblocks_after_record_action_result(self):
         static_table = StaticPolicyTable(env_type="email")
         stub_response = json.dumps({
-            "enabled_actions": ["get_emails", "forward_email"],
+            "enabled_actions": ["search_emails", "send_email"],
             "reasoning": "read then write",
         })
         priv_llm = PrivilegeControlLLM(llm=_StaticLLM(stub_response), model="stub")
@@ -338,27 +393,27 @@ class TestFullPipelineDependencySequencing:
             static_policy_table=static_table,
             dynamic_policy_generator=None,
             privilege_control_llm=priv_llm,
-            available_actions=["get_emails", "forward_email"],
+            available_actions=["search_emails", "send_email"],
         )
-        pipeline.initialize_task("Read inbox and forward the relevant message")
+        pipeline.initialize_task("Search inbox and send the relevant reply")
         pipeline.gate_chain.set_dynamic_policy(
-            DynamicPolicy(tool_dependencies={"forward_email": ("get_emails",)})
+            DynamicPolicy(tool_dependencies={"send_email": ("search_emails",)})
         )
 
-        forward_request = ActionRequest(
-            action_name="forward_email",
-            args={"to": user_literal("bob@company.com")},
-            user_request="Read inbox and forward the relevant message",
+        send_request = ActionRequest(
+            action_name="send_email",
+            args={"recipients": user_literal("bob@company.com")},
+            user_request="Search inbox and send the relevant reply",
             source=ActionSource.AGENT,
         )
 
-        decision, metadata = pipeline.process_action(forward_request)
+        decision, metadata = pipeline.process_action(send_request)
         assert decision == FinalDecision.VERIFICATION_REQUIRED
         assert "prerequisite actions" in metadata["reason"].lower()
 
-        pipeline.record_action_result("get_emails", output="msg_123")
+        pipeline.record_action_result("search_emails", output="found invoice thread")
 
-        decision, metadata = pipeline.process_action(forward_request)
+        decision, metadata = pipeline.process_action(send_request)
         assert decision == FinalDecision.ALLOWED
         assert metadata["verification_required"] is False
 

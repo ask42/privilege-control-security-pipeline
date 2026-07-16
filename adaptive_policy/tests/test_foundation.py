@@ -22,10 +22,10 @@ class TestValue:
         assert not v.is_tool_sourced()
 
     def test_tool_result(self):
-        v = tool_result("data", tool_name="get_emails")
+        v = tool_result("data", tool_name="get_unread_emails")
         assert v.is_tool_sourced()
         assert not v.is_trusted()
-        assert v.provenance.tool_name == "get_emails"
+        assert v.provenance.tool_name == "get_unread_emails"
 
 
 class TestActionRequest:
@@ -44,18 +44,18 @@ class TestActionRequest:
 
     def test_untrusted_args(self):
         ar = ActionRequest(
-            action_name="forward_email",
+            action_name="send_email",
             args={
-                "email_id": tool_result("msg_123", "get_emails"),
-                "to": user_literal("bob@external.com"),
+                "body": tool_result("Reply text", "search_emails"),
+                "recipients": user_literal("bob@external.com"),
             },
-            user_request="Forward the email",
+            user_request="Reply to the email",
             source=ActionSource.AGENT,
         )
         assert not ar.all_args_user_sourced()
         untrusted = ar.untrusted_args()
-        assert "email_id" in untrusted
-        assert "to" not in untrusted
+        assert "body" in untrusted
+        assert "recipients" not in untrusted
 
 
 class TestStaticPolicy:
@@ -82,16 +82,37 @@ class TestStaticPolicy:
         result = policy.evaluate(ar)
         assert isinstance(result, VerificationRequired)
 
-    def test_forward_email_allowed_by_declared_rule(self):
+    def test_get_unread_emails_allowed_by_declared_rule(self):
         policy = EmailStaticPolicy()
         ar = ActionRequest(
-            action_name="forward_email",
-            args={"to": user_literal("bob@company.com")},
-            user_request="Forward",
+            action_name="get_unread_emails",
+            args={},
+            user_request="Show unread",
             source=ActionSource.AGENT,
         )
         result = policy.evaluate(ar)
         assert isinstance(result, Allowed)
+
+    def test_send_email_cc_bcc_optional_and_format_checked(self):
+        policy = EmailStaticPolicy()
+        omitted = ActionRequest(
+            action_name="send_email",
+            args={"recipients": user_literal("alice@company.com")},
+            user_request="Send",
+            source=ActionSource.AGENT,
+        )
+        assert isinstance(policy.evaluate(omitted), Allowed)
+
+        invalid_bcc = ActionRequest(
+            action_name="send_email",
+            args={
+                "recipients": user_literal("alice@company.com"),
+                "bcc": user_literal("not-an-email"),
+            },
+            user_request="Send",
+            source=ActionSource.AGENT,
+        )
+        assert isinstance(policy.evaluate(invalid_bcc), VerificationRequired)
 
     def test_search_emails_allowed(self):
         policy = EmailStaticPolicy()
@@ -138,16 +159,16 @@ class TestDataFlowTracker:
 
     def test_mixed_provenance(self):
         ar = ActionRequest(
-            action_name="forward_email",
+            action_name="send_email",
             args={
-                "email_id": tool_result("msg_123", "get_emails"),
-                "to": user_literal("bob@company.com"),
+                "body": tool_result("Reply text", "search_emails"),
+                "recipients": user_literal("bob@company.com"),
             },
-            user_request="Forward",
+            user_request="Reply",
             source=ActionSource.AGENT,
         )
         assert not DataFlowTracker.is_all_user_sourced(ar)
-        assert "email_id" in DataFlowTracker.get_untrusted_args(ar)
+        assert "body" in DataFlowTracker.get_untrusted_args(ar)
 
 
 class TestAuditLog:
