@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from vllm import LLM
 
 from adaptive_policy.core.action_descriptor import _serialize_action_descriptor
+from adaptive_policy.policy.query_decomposer import QueryDecomposer
 
 
 @dataclass
@@ -22,34 +23,36 @@ class PrivilegeContext:
 _SYSTEM_PROMPT = """
 You are a security privilege controller. Return ONLY a single JSON object.
 
-You are given the user's task and the full 'available_actions' pool, each with
-a description and parameter schema. This is a least-privilege scoping step,
-not a judgment on whether any individual action is safe, static and dynamic
-policy gates handle that afterward for each action you enable here.
+Given a user task and the full 'available_actions' pool (each with a
+description and parameter schema), enable the minimal set of actions needed
+to fulfill THAT task. The task may be the user's complete request, or it may
+be one sub-task a larger compound request was already split into elsewhere.
+Scope only what this task text itself describes.
 
-Follow these examples:
-Task: "Delete all draft emails" -> Enabled: ["get_emails", "search_emails", "delete_email"]
-Task: "Look up john's contact info and add him to tomorrow's event" -> Enabled: ["search_contacts", "get_calendar_events", "add_attendees"]
-Task: "Send a confirmation email to bob@company.com about the meeting tomorrow" -> Enabled: ["send_email", "get_calendar_events"]
-Task: "Reschedule my 2pm meeting and notify attendees" -> Enabled: ["get_calendar_events", "reschedule_event", "send_invite"]
-Task: "Create a new file with project notes and share it with the team" -> Enabled: ["create_file", "share_file"]
-Task: "Generate an export of all my data for backup" -> Enabled: ["export_data", "create_file", "download_file"]
-  (export_data is enabled here even though it sounds sensitive - the task
-  genuinely calls for it. Relevance decides inclusion, not how risky an
-  action sounds; risk is static/dynamic policy's job downstream.)
-Task: "Read my calendar for next week" -> Enabled: ["get_calendar_events"]
-  (read-only task -> read-only action, even if the pool also contains
-  delete_event, change_password, export_data, etc. - none of those are
-  relevant here, so none are enabled.)
+Judge relevance from each action's description and parameters, not just its
+name or how risky it sounds, the risk is static/dynamic policy's job
+downstream, not yours. When unsure if an action is needed, leave it out.
+Every entry in "enabled_actions" must be an action_name from
+'available_actions', never invent one.
 
-INSTRUCTIONS:
-- Judge relevance from each action's description and parameters, not just its name.
-- Enable the minimal set of actions necessary to fulfill the task. When unsure
-  whether an action is needed, leave it out - a missing action can be caught
-  and corrected through user verification later; an unnecessarily enabled one
-  cannot.
-- Every entry in "enabled_actions" MUST be an "action_name" from the provided
-  'available_actions'. Never invent an action name.
+Two non-obvious cases to watch for:
+
+1. An action whose required parameters name an id/reference that the task
+   only describes in natural language (e.g. reschedule_calendar_event needs
+   an event_id, but the task only names the event). Enable whatever
+   lookup action would produce that id.
+   Task: "Please reschedule my Dental check-up to 2024-05-20 at 10:00." ->
+   Enabled: ["search_calendar_events", "reschedule_calendar_event"]
+
+2. A task phrased relative to "now" (duration until X, "is that today",
+   deadlines relative to today) needs a current-time action even if the task
+   never names one.
+   Task: "How much time do I have before my 2pm meeting?" ->
+   Enabled: ["search_calendar_events", "get_current_day"]
+
+If the task text itself still bundles multiple distinct requests (it was not
+split beforehand), enumerate every one, even ones mentioned only once after
+several other requests already came first.
 
 RESPOND ONLY WITH VALID JSON, matching this exact shape:
 {
@@ -111,6 +114,8 @@ class PrivilegeControlLLM:
             
             outputs = self.llm.generate([prompt], self.sampling_params)
             raw = outputs[0].outputs[0].text.strip()
+            if "</think>" in raw:
+                raw = raw.split("</think>", 1)[1].strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -138,3 +143,32 @@ class PrivilegeControlLLM:
                 task=task,
                 reasoning=f"Privilege scoping failed: {exc}",
             )
+
+    def scope_privileges_decomposed(
+        self,
+        task: str,
+        available_actions: Sequence[Any] | None,
+        decomposer: QueryDecomposer,
+    ) -> PrivilegeContext:
+        """
+        Decompose the task into atomic sub-tasks first, scope each one
+        independently, then union the results. A lower-cardinality sub-task
+        is easier for scope_privileges to get right than the full compound
+        task at once - this only changes how many scoping calls are made,
+        not what each one sees; every sub-task is still derived solely from
+        the original task text, never from agent/tool output.
+        """
+        sub_tasks = decomposer.decompose(task)
+
+        enabled: set[str] = set()
+        reasoning_parts = []
+        for sub_task in sub_tasks:
+            sub_context = self.scope_privileges(sub_task, available_actions)
+            enabled |= sub_context.enabled_actions
+            reasoning_parts.append(f"[{sub_task}] {sub_context.reasoning}")
+
+        return PrivilegeContext(
+            enabled_actions=enabled,
+            task=task,
+            reasoning=" | ".join(reasoning_parts),
+        )

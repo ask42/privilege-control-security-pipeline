@@ -128,7 +128,7 @@ class StaticPolicy(ABC):
             None,
         )
         if rule is None:
-            return VerificationRequired(reason="No static policy rule defined for this action")
+            return Allowed(reason="No static policy rule defined for this action; defaulting to allow")
 
         format_failures = [
             arg
@@ -241,8 +241,15 @@ class StaticPolicyTable:
         self._init_defaults()
 
     def _init_defaults(self) -> None:
-        """Initialize default policies for the environment."""
-        if self.env_type == "email":
+        """Initialize default policies for the environment.
+
+        "workspace" also registers EmailStaticPolicy for its 9 known email
+        actions - the AgentDojo workspace suite bundles email with calendar
+        and drive tools, and those email rules (e.g. delete_email requiring
+        verification) should still apply there. Calendar/drive actions have
+        no rules yet, so they fall through to evaluate()'s allow-default.
+        """
+        if self.env_type in ("email", "workspace"):
             policy = EmailStaticPolicy()
             # Register all 9 AgentDojo workspace email actions to use EmailStaticPolicy
             for action in [
@@ -253,10 +260,17 @@ class StaticPolicyTable:
                 self.policies[action] = policy
 
     def evaluate(self, action_request: ActionRequest) -> PolicyResult:
-        """Evaluate action against the static policy."""
+        """Evaluate action against the static policy.
+
+        No registered policy defaults to Allowed, not VerificationRequired.
+        This only runs for actions the Privilege Gate already put in scope
+        (GateChain checks privilege_context.enabled_actions before ever
+        calling here), so an action outside the initially-defined task scope
+        is still blocked upstream regardless of this default.
+        """
         policy = self.policies.get(action_request.action_name)
         if policy is None:
-            return VerificationRequired(reason="No static policy registered for this action")
+            return Allowed(reason="No static policy registered for this action; defaulting to allow")
         return policy.evaluate(action_request)
 
     def register(self, action_name: str, policy: StaticPolicy) -> None:

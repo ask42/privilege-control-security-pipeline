@@ -106,23 +106,29 @@ class GateChain:
 
         # Data Dependency Gate
         if self.dynamic_policy is not None:
-            required_data = self.dynamic_policy.required_data_for(action_request.action_name)
+            required_data_options = self.dynamic_policy.required_data_for(action_request.action_name)
 
-            # Same alias-aware lookup the Static Policy Gate's format check
-            # uses (e.g. "to" resolves to a real "recipients" arg), so a
-            # canonical data_format key matches regardless of what the
-            # actual tool schema calls the field.
-            mismatched_args = [
-                arg
-                for arg, expected_value in required_data.items()
-                if not _values_match(_resolve_arg_value(action_request, arg), expected_value)
-            ]
+            # Each option is one alternative expected-argument profile; the
+            # request only needs to match ONE of them (OR across options,
+            # AND across the args within a single option) - a task can call
+            # the same action type more than once with different content
+            # (e.g. send_email to alice, then separately to bob), and each
+            # call should be checked against the profile it actually
+            # matches, not forced to satisfy every profile at once.
+            def _option_matches(option: dict) -> bool:
+                # Same alias-aware lookup the Static Policy Gate's format
+                # check uses (e.g. "to" resolves to a "recipients"
+                # arg), so a canonical data_format key matches regardless
+                # of what the actual tool schema calls the field.
+                return all(
+                    _values_match(_resolve_arg_value(action_request, arg), expected_value)
+                    for arg, expected_value in option.items()
+                )
 
-            if mismatched_args:
+            if required_data_options and not any(_option_matches(option) for option in required_data_options):
                 entry.final_decision = FinalDecision.VERIFICATION_REQUIRED
                 entry.reason = (
-                    "Data Dependency Gate: arguments do not match task-expected content: "
-                    + ", ".join(mismatched_args)
+                    "Data Dependency Gate: arguments do not match any task-expected content profile"
                 )
                 self.audit_log.record(entry)
                 return FinalDecision.VERIFICATION_REQUIRED, entry

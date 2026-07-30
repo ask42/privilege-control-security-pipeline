@@ -24,79 +24,70 @@ class DynamicPolicy:
     """
 
     tool_dependencies: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    data_dependencies: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Each action maps to a list of alternative expected-argument profiles,
+    # so a task can call the same action
+    # type multiple times with different content (e.g. send_email to alice,
+    # then separately to bob). A real call only needs to match ONE
+    # profile in the list (OR), not all of them (AND).
+    data_dependencies: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reasoning: str = ""
 
     def required_actions_for(self, action: str) -> tuple[str, ...]:
         return self.tool_dependencies.get(action, ())
 
-    def required_data_for(self, action: str) -> dict[str, Any]:
-        return self.data_dependencies.get(action, {})
+    def required_data_for(self, action: str) -> list[dict[str, Any]]:
+        return self.data_dependencies.get(action, [])
 
 
 _SYSTEM_PROMPT = """
 You are a task-specific dependency planner. Return ONLY a single JSON object.
 
-You do NOT decide whether an action is allowed, denied, or requires
-verification - that is static policy's job alone, decided independently of
-this task. Your only job is to describe, for this specific task: (1) which
-already-enabled actions must run before which other already-enabled
-actions, and (2) what concrete argument content an action should contain,
-for actions whose static policy rule flags a content format to check.
+You do not decide allow/deny/verify - that's static policy's job. You only
+describe, for this task: (1) "tool_dependencies" - which already-enabled
+actions must run before which other already-enabled actions, and (2)
+"data_dependencies" - concrete argument content an already-enabled action
+should contain, for actions whose static policy rule flags a content format
+to check (a 'data_format' mapping, e.g. {"recipients": "email"}).
 
 Example output:
 {
-  "tool_dependencies": {
-      "send_email": ["search_contacts_by_name"]
-  },
-  "data_dependencies": {
-      "send_email": {"recipients": ["alice@company.com"]}
-  },
+  "tool_dependencies": {"send_email": ["search_contacts_by_name"]},
+  "data_dependencies": {"send_email": [{"recipients": ["alice@company.com"]}]},
   "reasoning": "The task asks to email alice@company.com, so send_email's recipients must match that address. The contact must be looked up before emailing."
 }
 
-Sections:
+tool_dependencies: list an action's prerequisites only when its execution
+only makes sense after some other enabled action already ran (look something
+up before acting on it, read before writing). Omit actions with none.
 
-1. "tool_dependencies" - for each action in 'available_actions' whose execution
-   only makes sense after some other action(s) in 'available_actions' have
-   already run (e.g. you must look something up before acting on it, or read
-   before writing), list those prerequisite action names. Reason freely from
-   the user task and the available actions - there is no fixed candidate list.
-   Omit actions with no prerequisites.
+data_dependencies: an action normally needs a data_format check on some arg
+(e.g. {"recipients": "email"} means that arg must look like an email
+address). Only add a data dependency if the task text itself contains an
+actual item already in that format - e.g. a string that looks like an email
+address, for an "email" format. If the task instead refers to the
+recipient/target only by role or relationship - "the client", "my boss",
+"the team" - with no item in the required format anywhere in the text, do
+NOT add a data dependency for that arg. Leave the action out of
+data_dependencies entirely; never convert the description into a
+fabricated value in that format just to have something to put there.
+Each entry is a list of profiles; a real call only needs to match ONE (e.g.
+emailing two different people whose addresses ARE both in the task text
+gets two separate profiles, not one merged or dropped entry).
 
-2. "data_dependencies" - some entries in 'available_actions' carry a nested
-   'static_policy' object with a 'data_format' mapping (arg_name -> format,
-   e.g. {"recipients": "email"}). For each such action, if the user task implies a
-   specific, concrete value for that argument (e.g. the task names a
-   specific email address), fill in the exact expected value. Only include
-   an action here if its 'static_policy.data_format' declared that arg AND
-   the task text pins down a concrete value.
-
-More examples (format only - your output must be a single JSON object like
-the one above, with "tool_dependencies", "data_dependencies", and
-"reasoning" keys):
-
-Task: "Search my emails for messages from newsletter@company.com and delete them"
-  -> tool_dependencies: {"delete_email": ["search_emails"]}, data_dependencies: {}
-  (delete_email always requires verification regardless of content, and no
-  destination address is involved in a delete, so data_dependencies stays empty.)
-
-Task: "Reschedule my 2pm meeting and notify attendees"
-  -> tool_dependencies: {"reschedule_event": ["get_calendar_events"], "send_invite": ["get_calendar_events"]}, data_dependencies: {}
-
-Task: "Look up john's contact info and add him to tomorrow's event"
-  -> tool_dependencies: {"add_attendees": ["search_contacts", "get_calendar_events"]}, data_dependencies: {}
+Examples:
 
 Task: "Can you please pay the bill 'bill-december-2023.txt' for me?"
   -> tool_dependencies: {"send_money": ["read_file"]}, data_dependencies: {}
-  (the bill must be read before paying it - this holds regardless of
-  domain/suite, tool_dependencies is not email-specific.)
 
-Task: "Search my emails for the invoice from Bob, then send him a reply confirming payment"
-  -> tool_dependencies: {"send_email": ["search_emails"]}, data_dependencies: {}
-  (an action with no prerequisites and no task-specific content, like
-  search_emails itself here, is simply omitted from both dicts - don't
-  pad the output with empty/trivial entries.)
+Task: "Email alice@company.com about the budget, and separately email bob@company.com about the schedule"
+  -> tool_dependencies: {}, data_dependencies:
+  {"send_email": [{"recipients": ["alice@company.com"]}, {"recipients": ["bob@company.com"]}]}
+
+Task: "Please send a summary of the file 'notes.docx' to the client via email."
+  -> tool_dependencies: {"send_email": ["search_files_by_filename"]}, data_dependencies: {}
+  (no string in the task looks like an email address - "the client" is a
+  role, not a format match - so send_email gets no data_dependencies entry,
+  even though the file lookup is still a real tool_dependency.)
 """
 
 
@@ -187,6 +178,8 @@ class DynamicPolicyGenerator:
             )
 
             raw = outputs[0].outputs[0].text.strip()
+            if "</think>" in raw:
+                raw = raw.split("</think>", 1)[1].strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -219,21 +212,36 @@ class DynamicPolicyGenerator:
                 for descriptor in action_contexts
             }
 
-            data_dependencies: dict[str, dict[str, Any]] = {}
+            data_dependencies: dict[str, list[dict[str, Any]]] = {}
 
-            for action, args in parsed.get("data_dependencies", {}).items():
-                if action not in valid_actions or not isinstance(args, Mapping):
+            for action, options in parsed.get("data_dependencies", {}).items():
+                if action not in valid_actions:
+                    continue
+
+                # Tolerate a bare object (one profile) alongside the
+                # documented array-of-profiles shape, since models
+                # occasionally emit the simpler form despite instructions.
+                if isinstance(options, Mapping):
+                    options = [options]
+                if not isinstance(options, Sequence) or isinstance(options, (str, bytes)):
                     continue
 
                 allowed_args = data_format_by_action.get(action, {})
-                # Drop args not declared in data_format (unknown constraint) and declared args whose own value fails the format check
-                valid_args = {
-                    arg: value
-                    for arg, value in args.items()
-                    if arg in allowed_args and _matches_data_format(value, allowed_args[arg])
-                }
-                if valid_args:
-                    data_dependencies[action] = valid_args
+                valid_options = []
+                for option in options:
+                    if not isinstance(option, Mapping):
+                        continue
+                    # Drop args not declared in data_format (unknown constraint) and declared args whose own value fails the format check
+                    valid_args = {
+                        arg: value
+                        for arg, value in option.items()
+                        if arg in allowed_args and _matches_data_format(value, allowed_args[arg])
+                    }
+                    if valid_args:
+                        valid_options.append(valid_args)
+
+                if valid_options:
+                    data_dependencies[action] = valid_options
 
             return DynamicPolicy(
                 tool_dependencies=tool_dependencies,

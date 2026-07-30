@@ -13,6 +13,7 @@ from adaptive_policy.policy.privilege_control import (
     PrivilegeControlLLM,
     PrivilegeContext,
 )
+from adaptive_policy.policy.query_decomposer import QueryDecomposer
 
 if TYPE_CHECKING:
     from adaptive_policy.core.action_request import ActionRequest
@@ -35,6 +36,7 @@ class AdaptiveSecurityPipeline:
         dynamic_policy_generator: DynamicPolicyGenerator | None = None,
         privilege_control_llm: PrivilegeControlLLM | None = None,
         available_actions: list[Any] | None = None,
+        query_decomposer: QueryDecomposer | None = None,
     ):
         self.static_policy = static_policy_table
         if privilege_control_llm is None:
@@ -42,6 +44,7 @@ class AdaptiveSecurityPipeline:
         self.privilege_control_llm = privilege_control_llm
         self.available_actions = available_actions or []
         self.dynamic_policy_generator = dynamic_policy_generator
+        self.query_decomposer = query_decomposer
         self.dynamic_policy: DynamicPolicy | None = None
         self.audit_log = AuditLog()
         self.gate_chain = GateChain(
@@ -55,10 +58,17 @@ class AdaptiveSecurityPipeline:
     def initialize_task(self, task_description: str) -> None:
         """Runs once at task start to scope initial privileges."""
         self.task_state = TaskExecutionState(task=task_description)
-        self.privilege_context = self.privilege_control_llm.scope_privileges(
-            task_description,
-            self.available_actions,
-        )
+        if self.query_decomposer is not None:
+            self.privilege_context = self.privilege_control_llm.scope_privileges_decomposed(
+                task_description,
+                self.available_actions,
+                self.query_decomposer,
+            )
+        else:
+            self.privilege_context = self.privilege_control_llm.scope_privileges(
+                task_description,
+                self.available_actions,
+            )
         if self.dynamic_policy_generator is not None:
             self.dynamic_policy = self.dynamic_policy_generator.generate(
                 task=task_description,

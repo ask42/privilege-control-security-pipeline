@@ -91,13 +91,16 @@ class TestStaticPolicyGate:
         decision, _ = gc.process_action(ar, priv)
         assert decision == FinalDecision.VERIFICATION_REQUIRED
 
-    def test_unregistered_action_defaults_to_verification_required(self):
+    def test_unregistered_action_defaults_to_allowed(self):
+        """An action with no static policy rule defaults to Allowed, not
+        VerificationRequired - this only runs for actions the Privilege Gate
+        already put in scope, so it can't grant access beyond that scope."""
         table = StaticPolicyTable(env_type="email")
         gc = GateChain(table)
         ar = _action("delete_universe")
         priv = PrivilegeContext({"delete_universe"}, "task")
         decision, _ = gc.process_action(ar, priv)
-        assert decision == FinalDecision.VERIFICATION_REQUIRED
+        assert decision == FinalDecision.ALLOWED
 
     def test_dynamic_policy_cannot_influence_allow_verify_deny(self):
         """Dynamic policy has no allow/deny mechanism, only dependencies.
@@ -120,13 +123,17 @@ class TestStaticPolicyGate:
         assert decision2 == FinalDecision.VERIFICATION_REQUIRED
         assert "Static Policy Gate" in entry2.reason
 
-    def test_undefined_static_action_stays_verify_regardless_of_dynamic_policy(self):
+    def test_undefined_static_action_allow_default_unaffected_by_dynamic_policy(self):
+        """An undefined action's static-gate default (Allowed) isn't changed
+        by dynamic policy declaring tool_dependencies for it - dynamic policy
+        only affects the Tool/Data Dependency Gates, which run after Static
+        Policy and never override its decision."""
         table = StaticPolicyTable(env_type="email")
         gc = GateChain(table, dynamic_policy=DynamicPolicy(tool_dependencies={"create_draft": ("search_emails",)}))
         ar = _action("create_draft")
         priv = PrivilegeContext({"create_draft"}, "task")
         decision, _ = gc.process_action(ar, priv)
-        assert decision == FinalDecision.VERIFICATION_REQUIRED
+        assert decision == FinalDecision.ALLOWED
 
 
 class TestToolDependencyGate:
@@ -164,7 +171,7 @@ class TestToolDependencyGate:
 class TestDataDependencyGate:
     def test_blocks_on_content_mismatch(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"recipients": "alice@company.com"}}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": [{"recipients": "alice@company.com"}]}))
         ar = _action("send_email", {"recipients": "mallory@attacker.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, entry = gc.process_action(ar, priv)
@@ -173,7 +180,7 @@ class TestDataDependencyGate:
 
     def test_allows_on_content_match(self):
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"recipients": "alice@company.com"}}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": [{"recipients": "alice@company.com"}]}))
         ar = _action("send_email", {"recipients": "alice@company.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, _ = gc.process_action(ar, priv)
@@ -182,7 +189,7 @@ class TestDataDependencyGate:
     def test_blocks_when_expected_arg_missing_entirely(self):
         """Dynamic policy expects a 'subject' value not present in the request."""
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"subject": "Re: invoice"}}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": [{"subject": "Re: invoice"}]}))
         ar = _action("send_email", {"recipients": "alice@company.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, entry = gc.process_action(ar, priv)
@@ -195,7 +202,7 @@ class TestDataDependencyGate:
         fixtures do) - the gate must resolve through the same alias table
         the Static Policy Gate's format check uses."""
         table = StaticPolicyTable(env_type="email")
-        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": {"recipients": "alice@company.com"}}))
+        gc = GateChain(table, dynamic_policy=DynamicPolicy(data_dependencies={"send_email": [{"recipients": "alice@company.com"}]}))
         ar = _action("send_email", {"to": "alice@company.com", "body": "hi"})
         priv = PrivilegeContext({"send_email"}, "task")
         decision, _ = gc.process_action(ar, priv)
@@ -209,7 +216,7 @@ class TestDataDependencyGate:
         gc = GateChain(
             table,
             dynamic_policy=DynamicPolicy(
-                data_dependencies={"send_email": {"recipients": ["alice@company.com", "bob@company.com"]}}
+                data_dependencies={"send_email": [{"recipients": ["alice@company.com", "bob@company.com"]}]}
             ),
         )
         priv = PrivilegeContext({"send_email"}, "task")
@@ -222,6 +229,37 @@ class TestDataDependencyGate:
         decision2, entry2 = gc.process_action(extra_recipient, priv)
         assert decision2 == FinalDecision.VERIFICATION_REQUIRED
         assert "Data Dependency Gate" in entry2.reason
+
+    def test_matches_any_one_of_multiple_profiles(self):
+        """A task that calls send_email twice with different recipients
+        registers both as separate profiles; a real call matching EITHER
+        one is allowed, not just the first."""
+        table = StaticPolicyTable(env_type="email")
+        gc = GateChain(
+            table,
+            dynamic_policy=DynamicPolicy(
+                data_dependencies={
+                    "send_email": [
+                        {"recipients": "alice@company.com"},
+                        {"recipients": "bob@company.com"},
+                    ]
+                }
+            ),
+        )
+        priv = PrivilegeContext({"send_email"}, "task")
+
+        to_alice = _action("send_email", {"recipients": "alice@company.com", "body": "budget"})
+        decision, _ = gc.process_action(to_alice, priv)
+        assert decision == FinalDecision.ALLOWED
+
+        to_bob = _action("send_email", {"recipients": "bob@company.com", "body": "schedule"})
+        decision2, _ = gc.process_action(to_bob, priv)
+        assert decision2 == FinalDecision.ALLOWED
+
+        to_mallory = _action("send_email", {"recipients": "mallory@attacker.com", "body": "hi"})
+        decision3, entry3 = gc.process_action(to_mallory, priv)
+        assert decision3 == FinalDecision.VERIFICATION_REQUIRED
+        assert "Data Dependency Gate" in entry3.reason
 
 
 class TestDynamicPolicyGeneratorParsing:
@@ -247,6 +285,8 @@ class TestDynamicPolicyGeneratorParsing:
         assert policy.tool_dependencies["send_email"] == ("search_emails",)
 
     def test_filters_data_dependency_args_not_declared_in_data_format(self):
+        """A bare object (one profile) is tolerated alongside the documented
+        array-of-profiles shape, and always normalized to a list on output."""
         response = json.dumps({
             "tool_dependencies": {},
             "data_dependencies": {"send_email": {"recipients": "alice@company.com", "body": "malicious injected text"}},
@@ -260,7 +300,32 @@ class TestDynamicPolicyGeneratorParsing:
             available_actions=["send_email"],
         )
         # send_email's static rule declares data_format for recipients/cc/bcc, not body.
-        assert policy.data_dependencies["send_email"] == {"recipients": "alice@company.com"}
+        assert policy.data_dependencies["send_email"] == [{"recipients": "alice@company.com"}]
+
+    def test_parses_multiple_data_dependency_profiles_for_one_action(self):
+        """The documented array-of-profiles shape: send_email called twice
+        with two different recipients becomes two separate profiles."""
+        response = json.dumps({
+            "tool_dependencies": {},
+            "data_dependencies": {
+                "send_email": [
+                    {"recipients": "alice@company.com"},
+                    {"recipients": "bob@company.com"},
+                ]
+            },
+            "reasoning": "test",
+        })
+        gen = self._generator(response)
+        table = StaticPolicyTable(env_type="email")
+        priv = PrivilegeContext({"send_email"}, "task")
+        policy = gen.generate(
+            task="task", privilege_context=priv, static_policy=table,
+            available_actions=["send_email"],
+        )
+        assert policy.data_dependencies["send_email"] == [
+            {"recipients": "alice@company.com"},
+            {"recipients": "bob@company.com"},
+        ]
 
     def test_prompt_context_excludes_static_rules_for_non_enabled_actions(self):
         """delete_email is registered but not enabled for this task, so its
