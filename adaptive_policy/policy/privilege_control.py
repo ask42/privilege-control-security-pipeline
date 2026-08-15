@@ -107,7 +107,7 @@ class PrivilegeControlLLM:
                     messages, 
                     tokenize=False, 
                     add_generation_prompt=True, 
-                    enable_thinking=False,
+                    enable_thinking=True,
                 )
             else:
                 prompt = messages[-1]["content"]

@@ -5,12 +5,12 @@ from adaptive_policy import (
     AuditEntry,
     AuditLog,
     Allowed,
-    EmailStaticPolicy,
+    StaticPolicy,
     user_literal,
     tool_result,
 )
 from adaptive_policy.policy.security_policy import VerificationRequired
-from adaptive_policy.policy.static_policy import StaticPolicyTable
+from adaptive_policy.policy.static_policy import EMAIL_RULES, StaticPolicyTable
 from adaptive_policy.core.data_flow import DataFlowTracker
 
 
@@ -60,7 +60,7 @@ class TestActionRequest:
 
 class TestStaticPolicy:
     def test_send_email_allowed_by_declared_rule(self):
-        policy = EmailStaticPolicy()
+        policy = StaticPolicy(EMAIL_RULES)
         ar = ActionRequest(
             action_name="send_email",
             args={"to": user_literal("alice@company.com")},
@@ -72,7 +72,7 @@ class TestStaticPolicy:
 
     def test_delete_email_requires_verification(self):
         """Deletion asks for verification instead of a hardcoded refusal."""
-        policy = EmailStaticPolicy()
+        policy = StaticPolicy(EMAIL_RULES)
         ar = ActionRequest(
             action_name="delete_email",
             args={"email_id": user_literal("msg_123")},
@@ -83,7 +83,7 @@ class TestStaticPolicy:
         assert isinstance(result, VerificationRequired)
 
     def test_get_unread_emails_allowed_by_declared_rule(self):
-        policy = EmailStaticPolicy()
+        policy = StaticPolicy(EMAIL_RULES)
         ar = ActionRequest(
             action_name="get_unread_emails",
             args={},
@@ -94,7 +94,7 @@ class TestStaticPolicy:
         assert isinstance(result, Allowed)
 
     def test_send_email_cc_bcc_optional_and_format_checked(self):
-        policy = EmailStaticPolicy()
+        policy = StaticPolicy(EMAIL_RULES)
         omitted = ActionRequest(
             action_name="send_email",
             args={"recipients": user_literal("alice@company.com")},
@@ -115,7 +115,7 @@ class TestStaticPolicy:
         assert isinstance(policy.evaluate(invalid_bcc), VerificationRequired)
 
     def test_search_emails_allowed(self):
-        policy = EmailStaticPolicy()
+        policy = StaticPolicy(EMAIL_RULES)
         ar = ActionRequest(
             action_name="search_emails",
             args={"query": user_literal("invoice")},
@@ -129,8 +129,8 @@ class TestStaticPolicy:
 class TestStaticPolicyTable:
     def test_policy_table_init(self):
         table = StaticPolicyTable(env_type="email")
-        assert "send_email" in table.policies
-        assert "delete_email" in table.policies
+        assert "send_email" in table.policy.rules_by_action
+        assert "delete_email" in table.policy.rules_by_action
 
     def test_policy_table_evaluate(self):
         table = StaticPolicyTable(env_type="email")

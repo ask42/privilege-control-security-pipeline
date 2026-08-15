@@ -1,23 +1,14 @@
 """Evaluate Qwen3-8B on AgentDojo with and without privilege control.
 
-Architecture:
-  - The agent LLM (OpenAILLM, driven against vLLM's OpenAI-compatible server
-    started with --enable-auto-tool-choice --tool-call-parser hermes) talks
-    over HTTP. Qwen3 emits native Hermes-style <tool_call>{"name":...}
-    </tool_call> blocks; vLLM's hermes parser converts those into structured
-    OpenAI tool_calls, which OpenAILLM consumes directly. (AgentDojo's
-    PromptingLLM was tried first, but it prompts for a Llama-3-style
-    <function-call>func(args)</function-call> text format that Qwen3 does not
-    natively produce, so its calls were silently dropped, OpenAILLM +
-    vLLM's own tool-call parser is the correct pairing for this model.)
-  - PrivilegeControlLLM / DynamicPolicyGenerator keep using an offline vLLM
-    LLM object (unchanged from the rest of the codebase's tests), placed on a
-    separate GPU so both can run concurrently without reloading the model.
-  - Pipelines are composed with AgentDojo's own SystemMessage / InitQuery /
-    ToolsExecutionLoop / ToolsExecutor primitives, following the same
-    structure AgentPipeline.from_config uses internally, with
-    PrivilegeControlGate inserted as the first element of the tool loop so it
-    sees every batch of proposed tool_calls before ToolsExecutor runs them.
+Agent LLM: OpenAILLM against vLLM's OpenAI-compatible server (hermes
+tool-call parser). AgentDojo's PromptingLLM was tried first but expects a
+Llama-3-style text format Qwen3 doesn't produce, silently dropping calls.
+
+Privilege control / dynamic policy: offline vLLM that runs on a separate GPU, so
+that it runs concurrently with the served agent model.
+
+Pipeline: AgentDojo's SystemMessage/InitQuery/ToolsExecutionLoop/ToolsExecutor,
+with PrivilegeControlGate + BlockedCallFeedback in the tool loop.
 """
 
 import os
@@ -42,16 +33,13 @@ from agentdojo.logging import OutputLogger
 from adaptive_policy.policy.privilege_control import PrivilegeControlLLM
 from adaptive_policy.policy.dynamic_policy import DynamicPolicyGenerator
 from adaptive_policy.policy.query_decomposer import QueryDecomposer
-from adaptive_policy.integrations.agentdojo_pipeline import PrivilegeControlGate
+from adaptive_policy.integrations.agentdojo_pipeline import PrivilegeControlGate, BlockedCallFeedback
 from adaptive_policy.tests.test_agentdojo_integration import load_agentdojo_action_descriptors
 
 BENCHMARK_VERSION = "v1"
 DEFAULT_SYSTEM_MESSAGE = load_system_message(None)
 
-# The privilege-control model runs as an offline vLLM instance on its own GPU
-# so it doesn't contend with the OpenAI-served agent model on GPU 0. Other
-# users share this box, so pick whichever GPU is actually free at import time
-# rather than hardcoding an index.
+# Box is shared with other users; pick a free GPU rather than hardcoding one.
 def _pick_free_gpu(exclude: set[str], min_free_gib: float = 20.0) -> str:
     import subprocess
     output = subprocess.check_output(
@@ -170,7 +158,7 @@ def create_gated_pipeline(
             SystemMessage(DEFAULT_SYSTEM_MESSAGE),
             InitQuery(),
             llm,
-            ToolsExecutionLoop([gate, ToolsExecutor(), llm]),
+            ToolsExecutionLoop([gate, ToolsExecutor(), BlockedCallFeedback(), llm]),
         ]
     )
     pipeline.name = f"{model}-privilege-control"

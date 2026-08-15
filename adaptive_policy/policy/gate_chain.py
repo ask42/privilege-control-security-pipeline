@@ -108,18 +108,9 @@ class GateChain:
         if self.dynamic_policy is not None:
             required_data_options = self.dynamic_policy.required_data_for(action_request.action_name)
 
-            # Each option is one alternative expected-argument profile; the
-            # request only needs to match ONE of them (OR across options,
-            # AND across the args within a single option) - a task can call
-            # the same action type more than once with different content
-            # (e.g. send_email to alice, then separately to bob), and each
-            # call should be checked against the profile it actually
-            # matches, not forced to satisfy every profile at once.
+            # Match any ONE profile (OR); AND across args within it.
             def _option_matches(option: dict) -> bool:
-                # Same alias-aware lookup the Static Policy Gate's format
-                # check uses (e.g. "to" resolves to a "recipients"
-                # arg), so a canonical data_format key matches regardless
-                # of what the actual tool schema calls the field.
+                # Alias-aware lookup, same as the Static Policy Gate's format check.
                 return all(
                     _values_match(_resolve_arg_value(action_request, arg), expected_value)
                     for arg, expected_value in option.items()

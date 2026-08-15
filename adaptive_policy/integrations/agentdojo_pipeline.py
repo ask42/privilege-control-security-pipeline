@@ -1,13 +1,16 @@
-"""AgentDojo pipeline element for privilege control gating.
+"""AgentDojo pipeline elements for privilege control gating.
 
-Sits inside a ToolsExecutionLoop, between the LLM element and ToolsExecutor:
-    ToolsExecutionLoop([PromptingLLM(...), PrivilegeControlGate(...), ToolsExecutor()])
+Usage: ToolsExecutionLoop([PrivilegeControlGate(...), ToolsExecutor(), BlockedCallFeedback(), LLM(...)])
 
-The LLM element appends a ChatAssistantMessage with proposed tool_calls.
-This gate filters that list down to only privilege-permitted calls before
-ToolsExecutor ever runs them, and injects ChatToolResultMessage entries
-(with an error field) for anything it blocks, so the agent sees why on
-its next turn instead of the call silently vanishing.
+PrivilegeControlGate filters an assistant turn's tool_calls down to
+privilege-permitted ones; blocked calls get a fallback message.
+
+Split into two elements because ToolsExecutor only runs when
+messages[-1] is still the assistant's message. Appending blocked-call
+feedback immediately would push a "tool" message to the end and make
+ToolsExecutor skip the surviving allowed calls too. So the gate defers
+blocked feedback via extra_args, and BlockedCallFeedback appends it
+after ToolsExecutor has run.
 """
 
 from collections.abc import Sequence
@@ -25,6 +28,16 @@ from adaptive_policy.policy.query_decomposer import QueryDecomposer
 from adaptive_policy.core.action_request import ActionRequest, ActionSource
 from adaptive_policy.core.value import user_literal
 from adaptive_policy.logging.audit_log import FinalDecision
+
+# Tells the agent why it was blocked and to keep working the task differently.
+_FALLBACK_TEMPLATE = (
+    "The tool call is not allowed due to {reason}. Please try other tools "
+    "or arguments and continue to finish the remainder of the user task: {task}"
+)
+
+# extra_args key PrivilegeControlGate uses to stash blocked-call feedback
+# for BlockedCallFeedback to pick up after ToolsExecutor has run.
+_PENDING_BLOCKED_KEY = "_privilege_control_pending_blocked"
 
 
 class PrivilegeControlGate(BasePipelineElement):
@@ -91,12 +104,13 @@ class PrivilegeControlGate(BasePipelineElement):
 
         allowed_calls = []
         blocked_results: list[ChatToolResultMessage] = []
+        task_description = self.current_task or query
 
         for tool_call in tool_calls:
             action_request = ActionRequest(
                 action_name=tool_call.function,
                 args={k: user_literal(v) for k, v in tool_call.args.items()},
-                user_request=self.current_task or query,
+                user_request=task_description,
                 source=ActionSource.AGENT,
             )
 
@@ -114,11 +128,36 @@ class PrivilegeControlGate(BasePipelineElement):
                         content=[text_content_block_from_string("")],
                         tool_call_id=tool_call.id,
                         tool_call=tool_call,
-                        error=f"[{decision.name}] {reason}",
+                        error=_FALLBACK_TEMPLATE.format(reason=reason, task=task_description),
                     )
                 )
 
+        # Trim tool_calls only; blocked_results is deferred (see module docstring).
         gated_assistant_message = {**messages[-1], "tool_calls": allowed_calls}
-        new_messages = [*messages[:-1], gated_assistant_message, *blocked_results]
+        new_messages = [*messages[:-1], gated_assistant_message]
+        new_extra_args = {**extra_args, _PENDING_BLOCKED_KEY: blocked_results}
 
-        return query, runtime, env, new_messages, extra_args
+        return query, runtime, env, new_messages, new_extra_args
+
+
+class BlockedCallFeedback(BasePipelineElement):
+    """Appends PrivilegeControlGate's deferred blocked-call feedback. Must run after ToolsExecutor."""
+
+    def __init__(self):
+        self.name = "BlockedCallFeedback"
+
+    def query(
+        self,
+        query: str,
+        runtime: FunctionsRuntime,
+        env: Any = None,
+        messages: Sequence[ChatMessage] = [],
+        extra_args: dict = {},
+    ) -> tuple[str, FunctionsRuntime, Any, Sequence[ChatMessage], dict]:
+        blocked_results = extra_args.get(_PENDING_BLOCKED_KEY)
+        if not blocked_results:
+            return query, runtime, env, messages, extra_args
+
+        new_messages = [*messages, *blocked_results]
+        new_extra_args = {k: v for k, v in extra_args.items() if k != _PENDING_BLOCKED_KEY}
+        return query, runtime, env, new_messages, new_extra_args

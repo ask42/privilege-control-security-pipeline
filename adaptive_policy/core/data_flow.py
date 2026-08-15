@@ -7,13 +7,8 @@ if TYPE_CHECKING:
 
 
 class DataFlowTracker:
-    """
-    Lightweight provenance tracking, probably good enough for now.
-    Does NOT implement full CaMeL interpreter; just tracks source origins.
-    
-    Currently determines if an action's args come from user, tool, or mix.
-    Can be extended to full taint tracking later, in to-do list.
-    """
+    """Lightweight provenance tracking: user vs. tool vs. mixed arg sources.
+    Not full CaMeL-style taint tracking, not implemented into the main pipeline yet."""
 
     @staticmethod
     def is_all_user_sourced(action_request: ActionRequest) -> bool:

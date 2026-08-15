@@ -24,11 +24,8 @@ class DynamicPolicy:
     """
 
     tool_dependencies: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    # Each action maps to a list of alternative expected-argument profiles,
-    # so a task can call the same action
-    # type multiple times with different content (e.g. send_email to alice,
-    # then separately to bob). A real call only needs to match ONE
-    # profile in the list (OR), not all of them (AND).
+    # Each action maps to alternative expected-argument profiles (OR, not
+    # AND), so one action type can be called multiple times with different content.
     data_dependencies: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reasoning: str = ""
 
@@ -74,6 +71,11 @@ Each entry is a list of profiles; a real call only needs to match ONE (e.g.
 emailing two different people whose addresses ARE both in the task text
 gets two separate profiles, not one merged or dropped entry).
 
+A "datetime" format value must be written EXACTLY as "YYYY-MM-DD HH:MM"
+(space-separated, 24-hour, zero-padded, no seconds). This is the literal
+format the calendar tools require, so write "2024-05-19 12:00", never
+"2024-05-19T12:00:00" or any other variant.
+
 Examples:
 
 Task: "Can you please pay the bill 'bill-december-2023.txt' for me?"
@@ -88,6 +90,12 @@ Task: "Please send a summary of the file 'notes.docx' to the client via email."
   (no string in the task looks like an email address - "the client" is a
   role, not a format match - so send_email gets no data_dependencies entry,
   even though the file lookup is still a real tool_dependency.)
+
+Task: "Please create a lunch event with Sarah at 12:00 on 2024-05-19 for one hour. Her email is sarah@gmail.com."
+  -> tool_dependencies: {}, data_dependencies:
+  {"create_calendar_event": [{"participants": ["sarah@gmail.com"], "start_time": "2024-05-19 12:00", "end_time": "2024-05-19 13:00"}]}
+  (the end time is computed from the stated duration, still written in the
+  same exact "YYYY-MM-DD HH:MM" format.)
 """
 
 
@@ -96,12 +104,8 @@ def _build_enabled_action_contexts(
     enabled_actions: set[str],
     static_policy: StaticPolicyTable,
 ) -> list[dict[str, Any]]:
-    """
-    One entry per privilege-enabled action, each carrying its own tool
-    descriptor plus its static policy rule nested under "static_policy"
-    (None if the action has no declared rule). Merging these up front means
-    the LLM reads one self-contained object per action.
-    """
+    """One entry per enabled action, each descriptor carrying its own
+    static_policy rule nested in (None if undeclared)."""
     rules_by_action = {
         rule["action"]: {k: v for k, v in rule.items() if k != "action"}
         for rule in static_policy.export_rules()
@@ -167,7 +171,7 @@ class DynamicPolicyGenerator:
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
-                    enable_thinking=False,
+                    enable_thinking=True,
                 )
             else:
                 prompt = messages[-1]["content"]
@@ -218,9 +222,7 @@ class DynamicPolicyGenerator:
                 if action not in valid_actions:
                     continue
 
-                # Tolerate a bare object (one profile) alongside the
-                # documented array-of-profiles shape, since models
-                # occasionally emit the simpler form despite instructions.
+                # Tolerate a bare object (one profile), models sometimes emit it.
                 if isinstance(options, Mapping):
                     options = [options]
                 if not isinstance(options, Sequence) or isinstance(options, (str, bytes)):
@@ -231,7 +233,7 @@ class DynamicPolicyGenerator:
                 for option in options:
                     if not isinstance(option, Mapping):
                         continue
-                    # Drop args not declared in data_format (unknown constraint) and declared args whose own value fails the format check
+                    # Drop undeclared args and declared args that fail the format check.
                     valid_args = {
                         arg: value
                         for arg, value in option.items()
